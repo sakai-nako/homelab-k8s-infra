@@ -1,7 +1,7 @@
 # local-infra
 
 > [!NOTE]
-> このリポジトリは、自宅の Forgejo で GitOps 運用しているプライベートリポジトリの**フィルタ済み公開ミラー**です (生成元コミット: `c332e0f`)。
+> このリポジトリは、自宅の Forgejo で GitOps 運用しているプライベートリポジトリの**フィルタ済み公開ミラー**です (生成元コミット: `bba5bcd`)。
 > SealedSecret 暗号文 (`secrets/*.yaml`) の除外と LAN 固有値の例示値への置換を行ったスナップショットを、
 > [tools/publish-public-mirror.ps1](tools/publish-public-mirror.ps1) で随時 push しています。
 > ArgoCD が同期する正本はプライベート側にあるため、運用の実コミット履歴はここには含まれません。
