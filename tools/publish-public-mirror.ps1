@@ -104,7 +104,8 @@ $notice = @'
 $readmePath = Join-Path $stage 'README.md'
 $readme = [IO.File]::ReadAllText($readmePath)
 $titleEnd = $readme.IndexOf("`n")
-[IO.File]::WriteAllText($readmePath, $readme.Insert($titleEnd + 1, $notice))
+# 注記の後ろに空行を置かないと、直後の本文行が blockquote に取り込まれる
+[IO.File]::WriteAllText($readmePath, $readme.Insert($titleEnd + 1, $notice + "`n"))
 
 # --- 6. 禁止パターン検査 (安全網) ----------------------------------------------
 $violations = [System.Collections.Generic.List[string]]::new()
