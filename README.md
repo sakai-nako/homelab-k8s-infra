@@ -1,7 +1,7 @@
 # local-infra
 
 > [!NOTE]
-> このリポジトリは、自宅の Forgejo で GitOps 運用しているプライベートリポジトリの**フィルタ済み公開ミラー**です (生成元コミット: `7afcf19`)。
+> このリポジトリは、自宅の Forgejo で GitOps 運用しているプライベートリポジトリの**フィルタ済み公開ミラー**です (生成元コミット: `c332e0f`)。
 > SealedSecret 暗号文 (`secrets/*.yaml`) の除外と LAN 固有値の例示値への置換を行ったスナップショットを、
 > [tools/publish-public-mirror.ps1](tools/publish-public-mirror.ps1) で随時 push しています。
 > ArgoCD が同期する正本はプライベート側にあるため、運用の実コミット履歴はここには含まれません。
@@ -112,6 +112,7 @@ local-infra/
 | [docs/runbooks/disaster-recovery.md](docs/runbooks/disaster-recovery.md) | 新マシン移行 / クラスタ全損からの完全復旧手順、月次 restore テストと DR dry-run の運用 |
 | [docs/runbooks/forgejo-registry.md](docs/runbooks/forgejo-registry.md) | 自作イメージの build / push と k3d からの pull 経路 |
 | [docs/runbooks/sonarqube-scan.md](docs/runbooks/sonarqube-scan.md) | SonarQube nightly 解析と quality-agent 連携の有効化 |
+| [docs/runbooks/public-mirror.md](docs/runbooks/public-mirror.md) | GitHub 公開ミラーの運用 (フィルタ済みスナップショットの publish 手順) |
 
 ---
 
