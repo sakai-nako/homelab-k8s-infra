@@ -1,0 +1,46 @@
+# Bootstrap root Application for the App-of-Apps pattern.
+#
+# Usage (run once after Forgejo + ArgoCD are up):
+#   kubectl apply -f bootstrap/04-root-app.yaml
+#
+# After apply, ArgoCD scans clusters/home/apps/ in the Forgejo-hosted
+# local-infra repository and creates one Application per YAML file there.
+# Adding a new app = adding a new file under clusters/home/apps/.
+#
+# Expected post-apply state:
+#   $ kubectl -n argocd get applications
+#   NAME       SYNC STATUS   HEALTH STATUS
+#   root       Synced        Healthy
+#   argocd     Synced        Healthy   <- ArgoCD self-managed
+#   forgejo    Synced        Healthy   <- Forgejo adopted by ArgoCD
+#
+# If argocd / forgejo show OutOfSync immediately after apply, it's likely the
+# Helm-managed labels / annotations differ from ArgoCD's expectations.
+# Trigger a Sync from the UI (or `argocd app sync argocd` etc.) — once.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+  # Prevent deletion of the root from cascading into all managed apps.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+    targetRevision: main
+    path: clusters/home/apps
+    directory:
+      recurse: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

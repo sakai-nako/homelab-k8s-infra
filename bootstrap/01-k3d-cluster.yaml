@@ -1,0 +1,77 @@
+# k3d cluster definition for local-infra home cluster.
+#
+# Usage (run from WSL2 local-infra distro):
+#   k3d cluster create --config bootstrap/01-k3d-cluster.yaml
+#   kubectl get nodes
+#
+# Delete:
+#   k3d cluster delete home
+#
+# Design notes:
+# - servers: 1 / agents: 2 — multi-node feel for learning, modest resource use.
+# - k3s image is pinned to match the version that smoke-test used (v1.31.5-k3s1).
+# - Traefik is kept (k3s default). If we later need ingress-nginx, add
+#   `options.k3s.extraArgs: [--disable=traefik]` and install ingress-nginx via ArgoCD.
+# - /mnt/nas is bind-mounted into every node so backup CronJobs can write to NAS
+#   via hostPath. See docs/backup.md.
+# - Ports 80/443 are exposed on the host via the k3d loadbalancer for *.local.test.
+# - subnet is pinned so the docker network gateway (= WSL host) is always
+#   172.18.0.1. hostAliases + registries rely on this: nodes resolve
+#   forgejo.local.test to the gateway, where the loadbalancer publishes port 80,
+#   so containerd can pull images from the in-cluster Forgejo registry
+#   (HTTP, hence the plain-http mirror endpoint below). Pods also get the same
+#   alias via CoreDNS NodeHosts.
+
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: home
+
+image: docker.io/rancher/k3s:v1.31.5-k3s1
+
+servers: 1
+agents: 2
+
+subnet: 172.18.0.0/16
+
+hostAliases:
+  - ip: 172.18.0.1
+    hostnames:
+      - forgejo.local.test
+
+registries:
+  config: |
+    mirrors:
+      "forgejo.local.test":
+        endpoint:
+          - http://forgejo.local.test
+
+ports:
+  - port: 80:80
+    nodeFilters:
+      - loadbalancer
+  - port: 443:443
+    nodeFilters:
+      - loadbalancer
+
+volumes:
+  - volume: /mnt/nas:/mnt/nas
+    nodeFilters:
+      - server:*
+      - agent:*
+
+options:
+  k3d:
+    wait: true
+    timeout: "120s"
+    disableLoadbalancer: false
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true
+  k3s:
+    extraArgs:
+      # kubelet が NAS マウント先を見に行こうとして失敗するのを避ける
+      - arg: --kubelet-arg=eviction-hard=imagefs.available<1%,nodefs.available<1%
+        nodeFilters:
+          - server:*
+          - agent:*

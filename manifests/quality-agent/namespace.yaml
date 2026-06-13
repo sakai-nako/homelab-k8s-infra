@@ -1,0 +1,7 @@
+# quality-agent 専用 namespace。
+# CronJob / ServiceAccount がここに入る。DSN 用 SealedSecret (quality-pg) も
+# この ns 宛に secrets Application から配布される (ns 生成後に controller が収束)。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: quality-agent

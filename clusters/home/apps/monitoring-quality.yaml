@@ -1,0 +1,38 @@
+# monitoring-quality: 品質スコアの Grafana ダッシュボードと劣化検知アラート (Phase 5)。
+#
+# manifests/monitoring-quality/ の ConfigMap 2 つを monitoring ns に配る:
+#   - quality-scores-dashboard (label grafana_dashboard=1): スコア時系列ダッシュボード。
+#     Grafana の dashboard sidecar (NAMESPACE=ALL) が取り込む。
+#   - quality-alert-rules (label grafana_alert=1): 劣化検知の Grafana-managed アラート
+#     ルール。alerts sidecar (charts/monitoring/values.yaml で有効化、自 ns のみ監視)
+#     が取り込み、同 ConfigMap 内の contact point + root policy で既存 Alertmanager へ
+#     転送される (AM からは am-forgejo-bridge が Forgejo Issue を自動起票。Phase 6)。
+#
+# kube-prometheus-stack (chart) とは Application を分ける規約のため独立させている。
+# 運用フローは docs/runbooks/quality-observability.md。
+#
+# prune: true (ConfigMap のみでデータを持たない)。
+# ServerSideApply=true: ダッシュボード JSON が育つと client-side apply の
+# last-applied annotation 256KB 制限に当たるため予防的に付与 (Job が無いので
+# Replace との併用制約とは無縁)。
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring-quality
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+    targetRevision: main
+    path: manifests/monitoring-quality
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true

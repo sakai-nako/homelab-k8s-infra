@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "am-forgejo-bridge"
+version = "0.1.0"
+description = "Alertmanager webhook receiver → Forgejo Issue 自動起票 (local-infra Phase 6)"
+requires-python = ">=3.11"
+# 依存ゼロ (標準ライブラリのみ)。quality-agent と同じく in-cluster コンテナを軽量に保つ。
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["am_forgejo_bridge*"]

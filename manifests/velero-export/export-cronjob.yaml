@@ -1,0 +1,130 @@
+# Velero バックアップの S3→NAS エクスポート CronJob (層 2 の最終段)。
+#
+# 役割 (docs/backup.md「層 2: Velero + SeaweedFS」3 段構成の 3 段目):
+#   1. Velero がクラスタリソース + PV を SeaweedFS の S3 バケット (velero) へ
+#   2. その実体は SeaweedFS の local-path PVC (WSL2 ext4) 上に置かれる
+#   3. ← この CronJob が velero バケットを S3 API で取得し /mnt/nas へ tar.gz 退避
+# これで層 2 も「NAS にあるものから復元できる」原則を満たす。
+#
+# 設計判断:
+# - velero namespace に置く: エクスポートは Velero バックアップの退避処理であり、
+#   かつ velero-credentials Secret (admin identity の aws profile 形式) を流用できる。
+#   seaweedfs-s3 SealedSecret は seaweedfs ns 固定なので cross-ns 参照できない一方、
+#   velero-credentials は同 ns にあり aws CLI がそのまま読める形式 (`cloud` キー)。
+# - seaweedfs-buckets Application (Replace=true + Force=true) には相乗りしない:
+#   あちらは immutable な Job 用に毎 sync delete & recreate する設定で、CronJob を
+#   混ぜると scheduling がリセットされ稀に実行が飛ぶ。別 Application で通常 sync する。
+# - NAS 書き込み可否を pre-check し、SMB 断 (既知の弱点) を Job 失敗として早期顕在化。
+# - エンドポイントは filer.s3 (seaweedfs-s3, port 8333)。SeaweedFS は path style 必須なので
+#   AWS_S3_ADDRESSING_STYLE=path を明示する。
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: velero-s3-nas-export
+  namespace: velero
+spec:
+  # Velero daily backup (0 4) と層 1 論理ダンプ (0 3 台) の後に走らせる。
+  schedule: "0 5 * * *"
+  # 直前の実行が長引いても重複起動しない (NAS への大きめ tar が重なるのを防ぐ)。
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: export
+              image: amazon/aws-cli:latest
+              env:
+                # velero-credentials の `cloud` を aws profile として読ませる。
+                - name: AWS_SHARED_CREDENTIALS_FILE
+                  value: /root/.aws/credentials
+                # SeaweedFS は virtual-host style 非対応。path style を強制する。
+                - name: AWS_S3_ADDRESSING_STYLE
+                  value: path
+                # k3d 上に IMDS は無い。探索の無駄な遅延/失敗を避ける。
+                - name: AWS_EC2_METADATA_DISABLED
+                  value: "true"
+                - name: ENDPOINT
+                  value: http://seaweedfs-s3.seaweedfs.svc.cluster.local:8333
+                - name: BUCKET
+                  value: velero
+                - name: NAS_DIR
+                  value: /mnt/nas/local-infra-backups/velero
+                - name: RETAIN_DAYS
+                  value: "30"
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+
+                  # amazon/aws-cli (Amazon Linux 2023 minimal) は tar/gzip を同梱しないため補う。
+                  # クラスタは image pull で外部ネットに出られる前提。エアギャップ要件が将来
+                  # 出たら tar 同梱のカスタムイメージへ差し替える。
+                  dnf install -y -q tar gzip
+
+                  # --- NAS 書き込み可否 pre-check (SMB 断を早期検知) ---
+                  mkdir -p "$NAS_DIR"
+                  if ! touch "$NAS_DIR/.write-test" 2>/dev/null; then
+                    echo "FATAL: $NAS_DIR is not writable (NAS マウント断?)" >&2
+                    exit 1
+                  fi
+                  rm -f "$NAS_DIR/.write-test"
+
+                  TS=$(date -u +%Y-%m-%dT%H%M%SZ)
+                  WORK=/work/velero
+                  mkdir -p "$WORK"
+
+                  # s3 sync のデフォルト 10 並列 GET は filer (S3 gateway 同居) の
+                  # メモリスパイクを誘発し OOMKill させた実績がある。同時ストリーミング
+                  # 本数を絞って filer 負荷を平準化する。/root/.aws は ro mount のため
+                  # aws configure set は使えず、config を /tmp に生成して指す。
+                  export AWS_CONFIG_FILE=/tmp/aws-config
+                  printf '[default]\ns3 =\n  max_concurrent_requests = 4\n' > "$AWS_CONFIG_FILE"
+
+                  # --- S3 (velero バケット) をローカル work へミラー ---
+                  # --delete で S3 側から消えた (TTL 失効) backup を work からも除去し、
+                  # tar が古い世代を抱え込まないようにする。
+                  echo "syncing s3://$BUCKET from $ENDPOINT ..."
+                  aws --endpoint-url "$ENDPOINT" s3 sync "s3://$BUCKET" "$WORK" --delete
+
+                  # --- tar.gz として NAS へ退避 (Windows から直接展開できる形式) ---
+                  OUT="$NAS_DIR/velero-${TS}.tar.gz"
+                  echo "archiving to $OUT ..."
+                  tar czf "$OUT" -C "$WORK" .
+
+                  # --- 保持期間超過の世代を削除 ---
+                  echo "pruning archives older than ${RETAIN_DAYS} days ..."
+                  find "$NAS_DIR" -name 'velero-*.tar.gz' -mtime +"$RETAIN_DAYS" -delete
+
+                  echo "done. current NAS archives:"
+                  ls -lh "$NAS_DIR"
+              volumeMounts:
+                - name: cloud-credentials
+                  mountPath: /root/.aws
+                  readOnly: true
+                - name: work
+                  mountPath: /work
+                - name: nas
+                  mountPath: /mnt/nas
+          volumes:
+            # velero-credentials.cloud (aws profile 形式) を credentials ファイルとして供給
+            - name: cloud-credentials
+              secret:
+                secretName: velero-credentials
+                items:
+                  - key: cloud
+                    path: credentials
+            # S3 sync 先の一時領域 (backup サイズがコンテナ書込層を圧迫しないよう分離)
+            - name: work
+              emptyDir: {}
+            # NAS は k3d server ノードに hostPath bind mount 済 (bootstrap/01-k3d-cluster.yaml)
+            - name: nas
+              hostPath:
+                path: /mnt/nas
+                type: Directory

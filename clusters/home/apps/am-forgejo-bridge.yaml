@@ -1,0 +1,28 @@
+# am-forgejo-bridge: Alertmanager → Forgejo Issue 起票 webhook receiver (Phase 6)。
+#
+# manifests/am-forgejo-bridge/ (Deployment + Service) を monitoring ns へ投入する。
+# Alertmanager 側の receiver/route 定義は charts/monitoring/values.yaml
+# (alertmanager.config)、PAT は secrets/am-forgejo-bridge-token.yaml。
+# 運用 runbook: docs/runbooks/quality-observability.md (起票フロー) /
+# docs/runbooks/disaster-recovery.md (KubeJobFailed 経由のバックアップ失敗検知)。
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: am-forgejo-bridge
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+    targetRevision: main
+    path: manifests/am-forgejo-bridge
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true

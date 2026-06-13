@@ -1,0 +1,50 @@
+# Sealed Secrets controller values for local-infra home cluster.
+#
+# Chart: sealed-secrets/sealed-secrets (https://bitnami-labs.github.io/sealed-secrets)
+# Referenced by clusters/home/apps/sealed-secrets.yaml
+#
+# Master encryption key is stored as a Secret in the `sealed-secrets` namespace
+# (label `sealedsecrets.bitnami.com/sealed-secrets-key: active`).
+# MUST be backed up to NAS (docs/backup.md → 層 1 keys/ ディレクトリ参照).
+# Without this key, all SealedSecret resources become permanently undecryptable.
+
+fullnameOverride: sealed-secrets-controller
+
+# Namespace 内に閉じ込めない(クラスタ全体の SealedSecret を扱う必要があるため)
+# デフォルトで全 namespace の SealedSecret を watch する設定
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# Pod-level security context (chart のデフォルトに沿う)
+podSecurityContext:
+  fsGroup: 65534
+  runAsNonRoot: true
+  runAsUser: 1001
+
+containerSecurityContext:
+  enabled: true
+  runAsNonRoot: true
+  runAsUser: 1001
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# Metrics は kube-prometheus-stack 投入後に有効化する
+metrics:
+  serviceMonitor:
+    enabled: false
+  dashboards:
+    create: false
+
+# 監視用 service の port を露出
+service:
+  type: ClusterIP
+  port: 8080

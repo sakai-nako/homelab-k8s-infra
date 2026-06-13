@@ -1,0 +1,79 @@
+# Velero values for local-infra home cluster.
+#
+# Chart: vmware-tanzu/velero 12.0.1 (deploys Velero 1.18.0)
+# Referenced by clusters/home/apps/velero.yaml
+#
+# 役割: 層 2 バックアップ。クラスタリソース + PV を SeaweedFS(S3)へ。backup 実体は
+#       SeaweedFS の local-path PVC に置かれ、S3→NAS エクスポート CronJob (別途) で
+#       /mnt/nas へ退避する 3 段構成の中核 (詳細 docs/backup.md)。
+#
+# 重要な設計判断:
+# - local-path は CSI snapshot 非対応 → PV は node-agent (kopia FSB) でバックアップ
+# - plugin は velero 1.18 に対応する velero-plugin-for-aws v1.14.1 を使う (互換厳守)
+# - S3 backend は SeaweedFS (filer.s3, seaweedfs-s3 service)。s3ForcePathStyle 必須
+# - velero バケットは seaweedfs-buckets Application の Job で事前作成 (createBuckets 不使用)
+
+# AWS S3 互換 plugin。velero 1.18 ↔ plugin v1.14.1 (バージョン不一致は BSL 接続失敗の主因)
+initContainers:
+  - name: velero-plugin-for-aws
+    image: velero/velero-plugin-for-aws:v1.14.1
+    imagePullPolicy: IfNotPresent
+    volumeMounts:
+      - mountPath: /target
+        name: plugins
+
+# credential は admin identity 流用の aws 形式 SealedSecret。
+# secrets/velero-credentials.yaml → controller が velero-credentials Secret を生成する。
+credentials:
+  useSecret: true
+  existingSecret: velero-credentials
+
+# CSI snapshot は使わない (local-path 非対応)。PV は FSB (kopia) でバックアップする。
+snapshotsEnabled: false
+deployNodeAgent: true
+
+configuration:
+  defaultVolumesToFsBackup: true
+  backupStorageLocation:
+    - name: default
+      provider: aws
+      bucket: velero
+      default: true
+      accessMode: ReadWrite
+      config:
+        region: us-east-1            # SeaweedFS では任意だが必須フィールド
+        s3Url: http://seaweedfs-s3.seaweedfs.svc.cluster.local:8333
+        s3ForcePathStyle: "true"
+
+# 毎日 04:00 (層 1 論理ダンプの後)、保持 30 日。バックアップ先 SeaweedFS 自身は除外。
+schedules:
+  daily:
+    disabled: false
+    schedule: "0 4 * * *"
+    template:
+      ttl: "720h"
+      storageLocation: default
+      includedNamespaces:
+        - "*"
+      excludedNamespaces:
+        - kube-system
+        - kube-public
+        - seaweedfs
+      defaultVolumesToFsBackup: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+nodeAgent:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 400m
+      memory: 512Mi

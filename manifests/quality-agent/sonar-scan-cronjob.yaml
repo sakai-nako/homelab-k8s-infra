@@ -1,0 +1,100 @@
+# local-infra リポジトリを SonarQube で nightly 解析する CronJob。
+#
+# quality-agent-nightly (06:00) の collect --sources sonarqube が読む解析結果を
+# 毎晩先に更新しておく (05:15 開始)。設定は repo 直下の sonar-project.properties。
+#
+# 必要な Secret は 2 つで、どちらも optional: true。SealedSecret 投入前は
+# スクリプトが検知して exit 0 でスキップするため、nightly は失敗しない
+# (有効化手順は docs/runbooks/sonarqube-scan.md):
+#   - forgejo-read (key: pat)      private リポジトリの clone 用 Forgejo PAT
+#   - sonarqube-token (key: token) SonarQube ユーザートークン (squ_...)
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: sonar-scan-nightly
+  namespace: quality-agent
+spec:
+  schedule: "15 5 * * *"
+  timeZone: Asia/Tokyo
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          volumes:
+            - name: src
+              emptyDir: {}
+          initContainers:
+            - name: clone
+              image: alpine/git:v2.52.0
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  if [ -z "$FORGEJO_PAT" ]; then
+                    echo "FORGEJO_PAT 未投入 (SealedSecret forgejo-read 未作成) のため clone をスキップ"
+                    exit 0
+                  fi
+                  git clone --quiet \
+                    "http://sakai:${FORGEJO_PAT}@forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git" \
+                    /src/repo
+                  # PAT を .git/config に残さない
+                  git -C /src/repo remote set-url origin \
+                    http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+                  # scanner-cli (uid 1000) が .scannerwork 等を書けるように所有者を移す
+                  chown -R 1000:1000 /src
+              env:
+                - name: FORGEJO_PAT
+                  valueFrom:
+                    secretKeyRef:
+                      name: forgejo-read
+                      key: pat
+                      optional: true
+              volumeMounts:
+                - name: src
+                  mountPath: /src
+          containers:
+            - name: sonar-scanner
+              image: sonarsource/sonar-scanner-cli:12.1
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  if [ ! -f /src/repo/sonar-project.properties ]; then
+                    echo "ソース未 clone のため解析をスキップ (FORGEJO_PAT 未投入?)"
+                    exit 0
+                  fi
+                  if [ -z "$SONAR_TOKEN" ]; then
+                    echo "SONAR_TOKEN 未投入 (SealedSecret sonarqube-token 未作成) のため解析をスキップ"
+                    exit 0
+                  fi
+                  cd /src/repo && sonar-scanner
+              env:
+                - name: SONAR_HOST_URL
+                  value: http://sonarqube-sonarqube.sonarqube.svc.cluster.local:9000
+                # キャッシュも emptyDir 側に置く (イメージの HOME に書かない)
+                - name: SONAR_USER_HOME
+                  value: /src/.sonar
+                - name: SONAR_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: sonarqube-token
+                      key: token
+                      optional: true
+              volumeMounts:
+                - name: src
+                  mountPath: /src
+              resources:
+                requests:
+                  cpu: 200m
+                  memory: 512Mi
+                limits:
+                  cpu: "1"
+                  memory: 2Gi

@@ -1,0 +1,182 @@
+# 月次 restore テスト CronJob (Phase 6 「復旧訓練」、docs/backup.md の検証層)。
+#
+# バックアップは「復元できて初めてバックアップ」— 層 1 論理ダンプを毎月 1 回
+# 実際に復元して検証する:
+#   container 1 (pg-restore-test):
+#     - 最新 pg-main ダンプの鮮度 (<26h) と gzip 整合性
+#     - 使い捨て PostgreSQL (initdb + pg_ctl, unix socket のみ) へ全量 restore
+#     - forgejo/grafana/sonarqube/quality DB の存在と主要テーブルの行数を検証
+#     - sealed-secrets 鍵バックアップの鮮度 (<8 日) を確認
+#   container 2 (forgejo-zip-test):
+#     - 最新 forgejo dump zip の鮮度 (<26h) と CRC 整合性 (python -m zipfile -t)
+#
+# いずれかの container が失敗すると Job が失敗し、KubeJobFailed アラート →
+# am-forgejo-bridge → Forgejo Issue が起票される (通知経路も同時に訓練される)。
+# 手動実行: kubectl -n backups create job --from=cronjob/backup-restore-test <name>
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-restore-test
+  namespace: backups
+spec:
+  # 毎月 1 日 07:00 JST (層 1 03:00 台 / 層 2 の後、nightly 評価 06:00 とも重ねない)
+  schedule: "0 7 1 * *"
+  timeZone: Asia/Tokyo
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Job の整理は history limit に任せる (月次なので失敗 Job は約 3 ヶ月残り、
+      # その間 KubeJobFailed = Forgejo Issue が解決まで開き続ける)
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            # emptyDir (PGDATA) へ postgres ユーザー (uid 26) が書けるようにする
+            fsGroup: 26
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: pg-restore-test
+              # ダンプ元クラスタ (cluster.yaml) と同じイメージ = 同じサーバ/psql バージョン
+              image: ghcr.io/cloudnative-pg/postgresql:17.2
+              env:
+                - name: NAS_PG_DIR
+                  value: /mnt/nas/local-infra-backups/logical/postgres
+                - name: NAS_KEYS_DIR
+                  value: /mnt/nas/local-infra-backups/keys
+                - name: PGDATA
+                  value: /var/lib/restore/pgdata
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  fail() { echo "FATAL: $1" >&2; exit 1; }
+
+                  # --- 最新ダンプの選定と鮮度チェック (<26h = nightly が生きている) ---
+                  LATEST=$(ls -t "$NAS_PG_DIR"/pg-main-*.sql.gz 2>/dev/null | head -1)
+                  [ -n "$LATEST" ] || fail "pg-main ダンプが 1 つも無い"
+                  echo "testing: $LATEST"
+                  find "$NAS_PG_DIR" -name "$(basename "$LATEST")" -mmin -1560 | grep -q . \
+                    || fail "最新ダンプが 26 時間より古い (postgres-dump CronJob 停止?)"
+                  gzip -t "$LATEST" || fail "gzip 整合性エラー"
+
+                  # --- 使い捨て PostgreSQL を起動 (TCP は閉じ unix socket のみ) ---
+                  initdb -D "$PGDATA" --auth=trust --username=postgres -E UTF8 >/dev/null
+                  pg_ctl -D "$PGDATA" -w -t 60 \
+                    -o "-c listen_addresses='' -k /tmp" \
+                    -l /tmp/pg.log start
+                  trap 'pg_ctl -D "$PGDATA" -m fast stop >/dev/null 2>&1 || true' EXIT
+
+                  # --- 全量 restore (役割重複等のエラーは想定内なのでログのみ) ---
+                  echo "restoring ..."
+                  gunzip -c "$LATEST" | \
+                    psql -h /tmp -U postgres -d postgres -q -o /dev/null \
+                    2>/tmp/restore-errors.log || true
+                  echo "--- restore 中のエラー (既存ロール等は想定内) 先頭 10 行 ---"
+                  head -10 /tmp/restore-errors.log || true
+                  echo "---"
+
+                  # --- 内容検証 ---
+                  for db in forgejo grafana sonarqube quality; do
+                    psql -h /tmp -U postgres -Atc \
+                      "SELECT 1 FROM pg_database WHERE datname='$db'" | grep -qx 1 \
+                      || fail "DB $db が復元されていない"
+                  done
+                  RUNS=$(psql -h /tmp -U postgres -d quality -Atc \
+                    "SELECT count(*) FROM quality_runs")
+                  [ "$RUNS" -ge 1 ] || fail "quality_runs が空 (期待: 1 行以上)"
+                  REPOS=$(psql -h /tmp -U postgres -d forgejo -Atc \
+                    "SELECT count(*) FROM repository")
+                  [ "$REPOS" -ge 1 ] || fail "forgejo.repository が空 (期待: 1 行以上)"
+                  psql -h /tmp -U postgres -d grafana -Atc \
+                    "SELECT count(*) FROM dashboard" >/dev/null \
+                    || fail "grafana.dashboard テーブルが無い"
+                  echo "OK: 4 DB 復元、quality_runs=$RUNS, repository=$REPOS"
+
+                  # --- sealed-secrets 鍵バックアップの鮮度 (<8 日 = 週次が生きている) ---
+                  LATEST_KEY=$(ls -t "$NAS_KEYS_DIR"/sealed-secrets-master-*.gpg 2>/dev/null | head -1)
+                  [ -n "$LATEST_KEY" ] || fail "sealed-secrets 鍵バックアップが無い"
+                  find "$NAS_KEYS_DIR" -name "$(basename "$LATEST_KEY")" -mmin -11520 | grep -q . \
+                    || fail "鍵バックアップが 8 日より古い (key-backup CronJob 停止?)"
+
+                  echo "restore test PASSED"
+              securityContext:
+                runAsUser: 26
+                runAsGroup: 26
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: nas
+                  mountPath: /mnt/nas
+                  readOnly: true
+                - name: pgdata
+                  mountPath: /var/lib/restore
+                - name: tmp
+                  mountPath: /tmp
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: "1"
+                  memory: 1Gi
+            - name: forgejo-zip-test
+              image: python:3.12-slim
+              env:
+                - name: NAS_FJ_DIR
+                  value: /mnt/nas/local-infra-backups/logical/forgejo
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  LATEST=$(ls -t "$NAS_FJ_DIR"/forgejo-*.zip 2>/dev/null | head -1)
+                  if [ -z "$LATEST" ]; then
+                    echo "FATAL: forgejo dump zip が 1 つも無い" >&2
+                    exit 1
+                  fi
+                  echo "testing: $LATEST"
+                  if ! find "$NAS_FJ_DIR" -name "$(basename "$LATEST")" -mmin -1560 | grep -q .; then
+                    echo "FATAL: 最新 zip が 26 時間より古い (forgejo-dump CronJob 停止?)" >&2
+                    exit 1
+                  fi
+                  # CRC 全数チェック (壊れていれば非ゼロ終了)
+                  python3 -m zipfile -t "$LATEST"
+                  echo "zip test PASSED"
+              securityContext:
+                runAsUser: 65534
+                runAsGroup: 65534
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: nas
+                  mountPath: /mnt/nas
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 256Mi
+          volumes:
+            - name: nas
+              hostPath:
+                path: /mnt/nas
+                type: Directory
+            - name: pgdata
+              emptyDir: {}
+            - name: tmp
+              emptyDir: {}

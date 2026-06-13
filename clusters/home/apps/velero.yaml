@@ -1,0 +1,37 @@
+# Velero Application managed by ArgoCD.
+#
+#   - Chart from the vmware-tanzu helm repo (https://vmware-tanzu.github.io/helm-charts)
+#   - values.yaml read from this repo (multi-source `$values` パターン)
+#   - prune: false で BackupStorageLocation / schedule を Git 事故から守る
+#
+# 依存: seaweedfs (S3 backend) + seaweedfs-buckets (velero バケット作成 Job) +
+#       velero-credentials SealedSecret。順序は automated sync で収束する
+#       (バケットが無い間 BSL は Unavailable、できれば次の検証で Available になる)。
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: velero
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: https://vmware-tanzu.github.io/helm-charts
+      chart: velero
+      targetRevision: 12.0.1
+      helm:
+        valueFiles:
+          - $values/charts/velero/values.yaml
+    - repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: velero
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

@@ -1,0 +1,54 @@
+# SeaweedFS バケット作成 Job (冪等)。
+#
+# filer.s3 は values の createBuckets を持たないため、プラットフォーム固定バケット
+# (velero 等) はこの Job で宣言的に作成する。
+#
+# hook ではなく通常リソース + Application 側 syncOption Replace=true + Force=true で運用する:
+#   - hook のみの Application は sync 時に hook が確実に実行されないことがあるため
+#     (実際、初回 hook 版はバケットを作れず velero BSL が NoSuchBucket になった)
+#   - Replace=true + Force=true により sync のたびに Job を delete & recreate する。
+#     Force なしの Replace 単体は in-place replace 止まりで、Job 自動付与の
+#     spec.selector を持たない manifest では "spec.selector: Required value" で失敗する
+# バケット存在チェック付きで冪等。mb 失敗は Job 失敗として顕在化させる (|| true しない)。
+#
+# 将来バケットを足すときは下の `for b in ...` のリストに名前を追加する。
+# (別リポジトリのアプリ向けセルフサービス用バケットは将来 Crossplane/COSI など別レイヤで扱う)
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seaweedfs-create-buckets
+  namespace: seaweedfs
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mb
+          image: amazon/aws-cli:latest
+          # seaweedfs_s3_config (identities JSON) から admin の AK/SK を抽出して使う
+          env:
+            - name: S3CONFIG
+              valueFrom:
+                secretKeyRef:
+                  name: seaweedfs-s3
+                  key: seaweedfs_s3_config
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              export AWS_ACCESS_KEY_ID=$(echo "$S3CONFIG" | grep -o '"accessKey": "[^"]*"' | head -1 | sed 's/.*"accessKey": "//; s/"//')
+              export AWS_SECRET_ACCESS_KEY=$(echo "$S3CONFIG" | grep -o '"secretKey": "[^"]*"' | head -1 | sed 's/.*"secretKey": "//; s/"//')
+              EP=http://seaweedfs-s3:8333
+              for b in velero; do
+                if aws --endpoint-url "$EP" s3 ls "s3://$b" >/dev/null 2>&1; then
+                  echo "bucket $b already exists"
+                else
+                  echo "creating bucket $b"
+                  aws --endpoint-url "$EP" s3 mb "s3://$b"
+                fi
+              done
+              echo "current buckets:"
+              aws --endpoint-url "$EP" s3 ls

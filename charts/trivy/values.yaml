@@ -1,0 +1,33 @@
+# trivy-operator values — ISO 25010 セキュリティ (CVE) のクラスタ内継続スキャナ。
+#
+# chart: aqua/trivy-operator 0.32.1 (Apache 2.0)。
+#   - クラスタ内の全 namespace を監視し VulnerabilityReport / ConfigAuditReport CRD を生成。
+#   - Prometheus メトリクス (trivy_image_vulnerabilities 等) を出し、quality-agent が集計に使う。
+#   - SBOM 生成は k3d で OOM 既知問題のため無効化 (SBOM は Phase 4 で Syft を CI 側に置く方針)。
+
+# 全 namespace を対象に継続スキャン。
+targetNamespaces: ""
+
+operator:
+  # SBOM レポート生成は無効 (メモリ重く k3d で OOM しやすい)。
+  sbomGenerationEnabled: false
+  # 脆弱性スキャナは有効 (デフォルト)。
+  vulnerabilityScannerEnabled: true
+
+# kube-prometheus-stack にメトリクスを scrape させる。
+# Prometheus は serviceMonitorSelector で release ラベルを要求するため、
+# monitoring リリース名 (= Application 名 monitoring) を明示して拾わせる。
+serviceMonitor:
+  enabled: true
+  labels:
+    release: monitoring
+
+# スキャンジョブの resource (個人運用なので控えめ。operator 本体の limit は chart 側で固定)。
+trivy:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 100M
+    limits:
+      cpu: 500m
+      memory: 500M

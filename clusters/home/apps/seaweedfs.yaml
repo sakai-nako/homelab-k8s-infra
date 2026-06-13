@@ -1,0 +1,43 @@
+# SeaweedFS Application managed by ArgoCD.
+#
+#   - Chart pulled from the SeaweedFS Helm repo (https://seaweedfs.github.io/seaweedfs/helm)
+#   - values.yaml read from this repo (multi-source `$values` pattern)
+#   - prune disabled: volume の実データ / filer メタデータを Git 事故から守る
+#
+# S3 認証は filer.s3.enableAuth=true + existingConfigSecret(seaweedfs-s3)。
+# SealedSecret は secrets/seaweedfs-s3.yaml で別管理 (secrets Application が apply)。
+# 初回の依存順序: この Application が seaweedfs ns を作成 (CreateNamespace=true) →
+# secrets Application が同 ns へ SealedSecret を展開 → controller が Secret 生成 →
+# filer pod がマウントして起動。両方 automated sync なので順序によらず最終的に収束
+# するが、Secret 生成までは filer が起動待ちになる点に注意。
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: seaweedfs
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: https://seaweedfs.github.io/seaweedfs/helm
+      chart: seaweedfs
+      # 4.29 の filer は idle 545Mi のメモリリグレッション (上流 issue #9035, 4.18+) と
+      # S3 GET ストリーミング中のメモリ蓄積で OOMKill を繰り返した。4.30-4.32 に
+      # stream 系のメモリ修正が複数入っているため更新 (2026-06)。
+      targetRevision: 4.32.0
+      helm:
+        valueFiles:
+          - $values/charts/seaweedfs/values.yaml
+    - repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: seaweedfs
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

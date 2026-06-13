@@ -1,0 +1,38 @@
+# kube-prometheus-stack Application managed by ArgoCD.
+#
+#   - Chart from the prometheus-community helm repo
+#   - values.yaml read from this repo (multi-source `$values` パターン)
+#   - ServerSideApply=true 必須: kube-prometheus-stack の CRD (prometheuses, prometheusrules 等)
+#     は巨大で、client-side apply だと last-applied annotation が 256KB 制限を超えて sync 失敗する。
+#
+# 依存: pg-main (grafana DB + grafana role) + grafana-pg / grafana-admin SealedSecret。
+#       monitoring ns は本 App が作成し、secrets App による monitoring ns の SealedSecret 投入は
+#       automated sync で eventual に収束する (velero ns と同じ挙動)。
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: https://prometheus-community.github.io/helm-charts
+      chart: kube-prometheus-stack
+      targetRevision: 86.1.0
+      helm:
+        valueFiles:
+          - $values/charts/monitoring/values.yaml
+    - repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

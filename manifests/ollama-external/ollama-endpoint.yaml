@@ -1,0 +1,29 @@
+# Windows ネイティブ Ollama (k3d 外, GPU 直結) への接続情報を集約した ConfigMap。
+#
+# 設計の経緯: 当初 selectorless Service + Endpoints で in-cluster DNS 名を提供しようとしたが、
+# ArgoCD はデフォルト設定で Endpoints / EndpointSlice を resource.exclusions に入れている
+# (高頻度で変わる自動管理オブジェクトのため) ので、raw Endpoints は同期対象から除外され機能しなかった。
+# そこで machine 依存の接続情報を ConfigMap に集約し、Phase 4 の quality-agent が env として読む方式にする。
+# これなら ArgoCD が確実に管理でき、IP/モデルの変更もこの 1 ファイルに閉じる (Recoverable 原則)。
+#
+# 到達 IP は Windows ホストの LAN IP を使う (2026-05-30 確定)。検討した代替が全て塞がった末の本命:
+#   - NAT ゲートウェイ IP (172.22.32.1) は WSL 再起動で Hyper-V がサブネットを振り直すと変わりうるため不採用。
+#   - host.k3d.internal は docker bridge GW (172.18.0.1) を指し Windows ホストへ届かない (pod から検証済)。
+#   - networkingMode=mirrored は k3d の公開ポート (API/ingress) を壊すため使えない (検証済)。
+#   → LAN IP は WSL 再起動では一切変わらず、NAT GW IP が変わっても WSL の default route が追従するため
+#     pod → 192.168.0.50 の経路は維持される。ルーターで DHCP 予約すれば恒久固定。
+# マシン買い替え時のみこの 1 ファイルを直す。詳細手順は bootstrap/05-ollama-windows.md Step 5。
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ollama-external
+  # quality-agent CronJob が configMapKeyRef で読むため同一 namespace に置く
+  # (env 参照は cross-namespace 不可。旧 quality ns から 0.4.0 で移動)
+  namespace: quality-agent
+data:
+  OLLAMA_BASE_URL: "http://192.168.0.50:11434"
+  OLLAMA_HOST: "192.168.0.50"
+  OLLAMA_PORT: "11434"
+  # 既定モデル。後から gemma2:9b 等に差し替え可 (quality-agent はこの値を参照)。
+  OLLAMA_MODEL: "qwen3:14b"

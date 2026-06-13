@@ -1,0 +1,38 @@
+# CloudNativePG Operator, managed by ArgoCD.
+#
+# This Application installs the operator only. The actual PostgreSQL Cluster
+# (single pg-main cluster shared across Forgejo / Grafana / SonarQube DBs in
+# later phases) is defined under manifests/postgres/ and managed by a separate
+# Application (postgres.yaml, created next).
+#
+#   - Chart pulled from https://cloudnative-pg.github.io/charts
+#   - values.yaml read from this repo (multi-source `$values` pattern)
+#   - prune disabled to protect the operator (and indirectly all DBs)
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cnpg-operator
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: https://cloudnative-pg.github.io/charts
+      chart: cloudnative-pg
+      targetRevision: 0.28.2
+      helm:
+        valueFiles:
+          - $values/charts/cnpg-operator/values.yaml
+    - repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cnpg-system
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

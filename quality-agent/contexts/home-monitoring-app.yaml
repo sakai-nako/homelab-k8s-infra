@@ -1,0 +1,33 @@
+# 利用コンテキスト (Context of Use). docs/quality-model.md 参照.
+# ISO/IEC 25019:2023: コンテキスト前提が変われば QiU 要件も再定義する。
+context_id: home-monitoring-app
+
+stakeholders:
+  primary: 自宅サーバー管理者 (本人)
+  secondary: 家族 (閲覧のみ)
+
+use_cases:
+  - 自宅 IoT 機器の稼働監視
+  - 月次レポートの閲覧
+
+environments:
+  - WSL2 + k3d (本リポジトリ)
+
+constraints:
+  safety_level: low       # 人命に関わらない
+  uptime_requirement: 95  # 個人運用許容 (%)
+  data_sensitivity: medium
+
+# トレードオフ評価・総合スコアの加重に使う特性別重み (合計 1.0)。
+# 変更履歴 (CoU 変更はスコア時系列の断絶になるため日付を残す):
+# - 2026-06-11: 25019 QiU (beneficialness/acceptability) を追加。
+#   maintainability 0.30→0.25, interaction 0.20→0.15 から 0.10 を捻出。
+#   個人運用で Issue/PR 流量が小さいため QiU は小さめの重みから始める。
+weights:
+  security: 0.20
+  reliability: 0.20
+  maintainability: 0.25
+  performance: 0.10
+  interaction: 0.15
+  beneficialness: 0.05
+  acceptability: 0.05

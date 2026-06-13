@@ -1,0 +1,42 @@
+# quality-agent の ServiceAccount と RBAC。
+#
+# collector は in-cluster の kubectl で VulnerabilityReport を全 namespace 横断で
+# 読む。そのための最小権限 (get/list/watch) を ClusterRole で付与する。
+# 書き込み権限は一切持たせない (read-only スキャナ)。
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: quality-agent
+  namespace: quality-agent
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: quality-agent-reader
+rules:
+  # Trivy (trivy-operator) の脆弱性レポート
+  - apiGroups: ["aquasecurity.github.io"]
+    resources:
+      - vulnerabilityreports
+      - configauditreports
+      - clustercompliancereports
+    verbs: ["get", "list", "watch"]
+  # 将来 collector が参照する基本リソース (Pod の resource limits / probe など)。
+  # 現状は未使用だが read-only スキャナの素地として付与しておく。
+  - apiGroups: [""]
+    resources: ["pods", "namespaces"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: quality-agent-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: quality-agent-reader
+subjects:
+  - kind: ServiceAccount
+    name: quality-agent
+    namespace: quality-agent

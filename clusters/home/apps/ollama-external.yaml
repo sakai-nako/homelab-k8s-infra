@@ -1,0 +1,33 @@
+# ollama-external Application managed by ArgoCD.
+#
+#   - 自作 raw マニフェスト (ConfigMap) なので chart ではなく manifests/ を参照。
+#   - Windows ネイティブ Ollama (k3d 外) への接続情報 (base URL / model) を quality-agent ns に置く。
+#     消費者は quality-agent CronJob のみで、env の configMapKeyRef は cross-namespace
+#     参照不可のため同居させる (旧 quality ns から 0.4.0 で移動。空いた quality ns は手動削除)。
+#   - Ollama 本体はクラスタ内に立てない (GPU 直結のため Windows ホストで稼働)。
+#   - 注意: 当初の selectorless Service + Endpoints 方式は ArgoCD が Endpoints を
+#     resource.exclusions で除外するため不可。接続情報は ConfigMap に集約する方式に変更した。
+#
+# prune: true。quality-agent ns は quality-agent Application が作る (CreateNamespace は保険)。
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ollama-external
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+    targetRevision: main
+    path: manifests/ollama-external
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: quality-agent
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

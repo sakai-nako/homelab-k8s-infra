@@ -1,0 +1,35 @@
+# ArgoCD self-managed Application.
+#
+# After the root Application is synced for the first time, ArgoCD takes over
+# its own lifecycle:
+#   - Chart pulled from upstream argo-helm
+#   - values.yaml read from this repo (multi-source `$values` pattern)
+#   - prune disabled as safety net (never delete ArgoCD itself by mistake)
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: https://argoproj.github.io/argo-helm
+      chart: argo-cd
+      targetRevision: 9.5.15
+      helm:
+        valueFiles:
+          - $values/charts/argocd/values.yaml
+    - repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

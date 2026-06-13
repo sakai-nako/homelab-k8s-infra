@@ -1,0 +1,35 @@
+# Forgejo Application managed by ArgoCD.
+#
+#   - Chart pulled from OCI registry at code.forgejo.org
+#   - values.yaml read from this repo (multi-source `$values` pattern)
+#   - prune disabled to protect the SQLite DB and the repository data
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: forgejo
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    # ArgoCD の OCI Helm 仕様では repoURL に chart 名まで含めるのが正しい
+    # (Helm CLI とは異なる挙動)
+    - repoURL: oci://code.forgejo.org/forgejo-helm/forgejo
+      chart: forgejo
+      targetRevision: 17.1.0
+      helm:
+        valueFiles:
+          - $values/charts/forgejo/values.yaml
+    - repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: forgejo
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

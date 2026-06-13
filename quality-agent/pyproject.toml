@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quality-agent"
+version = "0.6.1"
+description = "ISO/IEC 25010:2023 + 25019:2023 自動品質評価エージェント (local-infra)"
+requires-python = ">=3.11"
+# 依存は意図的に最小. 本体は標準ライブラリ + PyYAML のみで動く
+# (in-cluster コンテナを軽量に保ち、保守性・可搬性を上げるため)。
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# PostgreSQL 保存 (report --to-postgres) でのみ必要な任意依存。
+# core / stdout 経路は標準ライブラリ + PyYAML のみで動く。
+pg = [
+    "psycopg[binary]>=3.1",
+]
+
+[project.scripts]
+quality-agent = "quality_agent.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["quality_agent*"]
+
+[tool.setuptools.package-data]
+"quality_agent.report" = ["schema.sql"]

@@ -1,0 +1,114 @@
+# Forgejo Helm values for local-infra home cluster.
+#
+# Chart: oci://code.forgejo.org/forgejo-helm/forgejo (>= 17.x)
+# Referenced by:
+#   - bootstrap/02-forgejo-install.md (manual helm install)
+#   - clusters/home/apps/forgejo.yaml (ArgoCD Application, Phase 2)
+#
+# Both must use this file unmodified so ArgoCD self-heal converges cleanly.
+#
+# DB strategy: external PostgreSQL via CloudNativePG (pg-main cluster in
+# `postgres` namespace). Connection password is supplied through the
+# `forgejo-pg` SealedSecret in the forgejo namespace.
+
+image:
+  registry: code.forgejo.org
+  repository: forgejo/forgejo
+  # Empty tag = use the chart's appVersion (avoids drift between Forgejo and chart).
+  tag: ""
+  pullPolicy: IfNotPresent
+  rootless: true
+
+replicaCount: 1
+
+strategy:
+  type: Recreate
+
+service:
+  http:
+    type: ClusterIP
+    port: 3000
+  ssh:
+    type: ClusterIP
+    port: 22
+
+ingress:
+  enabled: true
+  className: traefik
+  hosts:
+    - host: forgejo.local.test
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: local-path
+  accessModes:
+    - ReadWriteOnce
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+gitea:
+  admin:
+    existingSecret: forgejo-admin-secret
+
+  config:
+    APP_NAME: "local-infra Forgejo"
+    server:
+      DOMAIN: forgejo.local.test
+      SSH_DOMAIN: forgejo.local.test
+      ROOT_URL: http://forgejo.local.test/
+      HTTP_PORT: 3000
+      DISABLE_SSH: false
+      SSH_PORT: 22
+      LANDING_PAGE: explore
+      # Chart defaults this to true when persistence is enabled; stated
+      # explicitly so Git (not chart defaulting) is the source of truth.
+      LFS_START_SERVER: true
+    service:
+      DISABLE_REGISTRATION: true
+      REQUIRE_SIGNIN_VIEW: false
+    repository:
+      DEFAULT_PRIVATE: private
+      ENABLE_PUSH_CREATE_USER: true
+      ENABLE_PUSH_CREATE_ORG: false
+    security:
+      INSTALL_LOCK: true
+    indexer:
+      ISSUE_INDEXER_TYPE: bleve
+      REPO_INDEXER_ENABLED: true
+    log:
+      LEVEL: info
+    metrics:
+      ENABLED: true
+    database:
+      DB_TYPE: postgres
+      HOST: pg-main-rw.postgres.svc.cluster.local:5432
+      NAME: forgejo
+      USER: forgejo
+      SSL_MODE: require
+      # PASSWD is injected via env (see additionalConfigFromEnvs below)
+      # to avoid storing it in the values file.
+
+  # PostgreSQL password is supplied via env-var from a SealedSecret
+  # (secrets/forgejo-pg.yaml decrypted by sealed-secrets controller into
+  # forgejo namespace as `forgejo-pg`).
+  additionalConfigFromEnvs:
+    - name: FORGEJO__database__PASSWD
+      valueFrom:
+        secretKeyRef:
+          name: forgejo-pg
+          key: password
+
+# ServiceMonitor will be enabled once kube-prometheus-stack is in (Phase 2).
+serviceMonitor:
+  enabled: false

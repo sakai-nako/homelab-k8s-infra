@@ -1,0 +1,29 @@
+# quality-agent: ISO 25010/25019 評価エージェントの実行基盤 (Phase 4)。
+#
+# manifests/quality-agent/ の生マニフェスト (Namespace / SA / RBAC / CronJob) を束ねる。
+# nightly CronJob が collect→analyze→score→report --to-postgres を in-cluster で実行し、
+# pg-main の quality DB にスコアを時系列保存する。push/PR トリガの PR コメント連携は
+# 後続の Forgejo Actions step で追加する。
+#
+# prune: true (通常リソース)。CronJob/SA/RBAC はデータを持たないため誤削除リスク低。
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: quality-agent
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+    targetRevision: main
+    path: manifests/quality-agent
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: quality-agent
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

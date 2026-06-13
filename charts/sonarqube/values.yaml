@@ -1,0 +1,87 @@
+# SonarQube CE (Community Build) values — ISO 25010 保守性ほかの静的解析エンジン。
+#
+# chart: sonarqube/sonarqube 2026.3.0 (SonarSource 公式 helm-chart-sonarqube)
+#   - community.enabled: true で商用 Server ではなく Community Build イメージを使う。
+#   - 内蔵 PostgreSQL は使わず jdbcOverwrite で共有 pg-main に外部接続 (grafana と同方針)。
+#   - DB password と monitoring passcode は sonarqube ns の sonarqube-app SealedSecret から注入。
+#   - 埋め込み Elasticsearch のため vm.max_map_count を initSysctl(privileged initContainer)で設定。
+#
+# CE はブランチ/PR 解析を持たないため、quality-agent は Web API でメトリクスを取得する設計
+# (docs/quality-model.md 参照)。PR コメントは quality-agent + Forgejo API 側で行う。
+
+# Community Build を使用 (これを false にすると商用 SonarQube Server になる)。
+community:
+  enabled: true
+
+# 共有 PostgreSQL (pg-main) へ外部接続。内蔵 postgresql subchart は使わない。
+jdbcOverwrite:
+  enabled: true
+  jdbcUrl: "jdbc:postgresql://pg-main-rw.postgres.svc.cluster.local:5432/sonarqube"
+  jdbcUsername: "sonarqube"
+  # password は平文で values に置かず、既存 Secret (sonarqube-app) を参照する。
+  jdbcSecretName: "sonarqube-app"
+  jdbcSecretPasswordKey: "jdbc-password"
+
+# monitoringPasscode 未設定だと Pod が永遠に Ready にならない仕様。Secret から読む。
+monitoringPasscodeSecretName: "sonarqube-app"
+monitoringPasscodeSecretKey: "monitoring-passcode"
+
+# Elasticsearch 要件 vm.max_map_count >= 524288 を privileged initContainer で設定。
+# k3d/k3s ノードはデフォルトで privileged を許可するため通常はこれで足りる。
+initSysctl:
+  enabled: true
+  vmMaxMapCount: 524288
+  fsFileMax: 131072
+
+# クラスタ全体の再起動 (WSL/Windows リブート) 時、SonarQube が pg-main より先に
+# 起動すると DB 接続の fail-fast → graceful exit (exit 0) → CrashLoopBackOff を
+# DB が Ready になるまで 6〜7 回繰り返す (1 ブートで restartCount がその分増える)。
+# pg_isready が成功するまで待つ initContainer でこのレースを防ぐ。
+# イメージは pg-main と同一 (manifests/postgres/cluster.yaml) でノードにキャッシュ済み。
+extraInitContainers:
+  - name: wait-for-db
+    image: ghcr.io/cloudnative-pg/postgresql:17.2
+    command:
+      - sh
+      - -c
+      - until pg_isready -h pg-main-rw.postgres.svc.cluster.local -p 5432; do sleep 2; done
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 26
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi
+
+# Traefik Ingress で sonar.local.test に公開 (monitoring と同方針)。
+ingress:
+  enabled: true
+  ingressClassName: traefik
+  hosts:
+    - name: sonar.local.test
+      path: /
+      pathType: Prefix
+
+# プラグイン/拡張・データ用 PVC (本体データは外部 DB 側。ここは extensions/temp 等)。
+persistence:
+  enabled: true
+  storageClass: local-path
+  accessMode: ReadWriteOnce
+  size: 5Gi
+
+# Small 構成 (≤1M LOC 目安: 4Gi/2cores)。個人運用なので控えめに requests を置く。
+resources:
+  requests:
+    cpu: 500m
+    memory: 2Gi
+  limits:
+    cpu: "2"
+    memory: 4Gi

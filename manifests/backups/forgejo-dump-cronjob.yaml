@@ -1,0 +1,132 @@
+# Forgejo 論理ダンプ CronJob (層 1、docs/backup.md)。
+#
+# `forgejo dump` がリポジトリ (git data)・添付・DB ダンプ (gitea-db.sql) を
+# 1 つの zip にまとめる。Windows から直接展開できる形式 (Recoverable 原則)。
+# 復元手順は docs/runbooks/disaster-recovery.md (zip 展開 + psql + repos 配置)。
+#
+# 設計判断:
+# - 稼働中の forgejo pod と同じ data PVC (gitea-shared-storage, RWO) を read-only で
+#   共有マウントする。local-path PV の nodeAffinity により自動的に同一ノードへ
+#   スケジュールされるので RWO でも共存できる。
+# - app.ini は chart の configure-gitea initContainer が PVC 上
+#   (/data/gitea/conf/app.ini) に生成済みで、DB パスワードも書き込まれている。
+#   そのため追加の Secret 参照は不要。
+# - イメージはデプロイ中の forgejo と同じものを pin する。chart 更新で appVersion が
+#   変わったらここも追従させること (dump フォーマットの互換性のため)。
+# - 失敗は KubeJobFailed アラート → am-forgejo-bridge → Forgejo Issue 起票。
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: forgejo-dump
+  namespace: forgejo
+spec:
+  schedule: "0 3 * * *"
+  timeZone: Asia/Tokyo
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Job の整理は history limit に任せる (postgres-dump と同じ判断で ttl 無し)
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            # rootless イメージのユーザー。NAS (cifs, uid=1000) とも一致する
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: dump
+              image: code.forgejo.org/forgejo/forgejo:15.0.2-rootless
+              env:
+                - name: GITEA_APP_INI
+                  value: /data/gitea/conf/app.ini
+                - name: GITEA_CUSTOM
+                  value: /data/gitea
+                - name: GITEA_WORK_DIR
+                  value: /data
+                - name: GITEA_TEMP
+                  value: /tmp/gitea
+                - name: TMPDIR
+                  value: /tmp/gitea
+                # HOME は data PVC (read-only) 上を指さないよう /tmp 側へ逃がす
+                - name: HOME
+                  value: /tmp/home
+                - name: NAS_DIR
+                  value: /mnt/nas/local-infra-backups/logical/forgejo
+                - name: RETAIN_DAYS
+                  value: "14"
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+
+                  # --- NAS 書き込み可否 pre-check (SMB 断を早期検知) ---
+                  mkdir -p "$NAS_DIR"
+                  if ! touch "$NAS_DIR/.write-test" 2>/dev/null; then
+                    echo "FATAL: $NAS_DIR is not writable (NAS マウント断?)" >&2
+                    exit 1
+                  fi
+                  rm -f "$NAS_DIR/.write-test"
+
+                  mkdir -p /tmp/gitea /tmp/home /tmp/dump
+                  TS=$(date -u +%Y-%m-%dT%H%M%SZ)
+
+                  echo "running forgejo dump ..."
+                  forgejo dump --config "$GITEA_APP_INI" \
+                    --work-path /data \
+                    --tempdir /tmp/dump \
+                    --type zip \
+                    --file "/tmp/dump/forgejo-${TS}.zip"
+
+                  SIZE=$(stat -c %s "/tmp/dump/forgejo-${TS}.zip")
+                  if [ "$SIZE" -lt 102400 ]; then
+                    echo "FATAL: dump too small (${SIZE} bytes)" >&2
+                    exit 1
+                  fi
+                  mv "/tmp/dump/forgejo-${TS}.zip" "$NAS_DIR/"
+
+                  echo "pruning dumps older than ${RETAIN_DAYS} days ..."
+                  find "$NAS_DIR" -name 'forgejo-*.zip' -mtime +"$RETAIN_DAYS" -delete
+
+                  echo "done:"
+                  ls -lh "$NAS_DIR/forgejo-${TS}.zip"
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+                - name: nas
+                  mountPath: /mnt/nas
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: "1"
+                  memory: 1Gi
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: gitea-shared-storage
+                readOnly: true
+            # dump の zip 作業領域。リポジトリ実体より一回り大きい空きが要る
+            - name: tmp
+              emptyDir: {}
+            - name: nas
+              hostPath:
+                path: /mnt/nas
+                type: Directory

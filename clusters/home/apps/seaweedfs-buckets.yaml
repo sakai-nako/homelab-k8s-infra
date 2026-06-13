@@ -1,0 +1,41 @@
+# SeaweedFS バケット作成 Application。
+#
+# filer.s3 が createBuckets 非対応のため、プラットフォーム固定バケット (velero 等) を
+# 冪等 Job (manifests/seaweedfs/) で宣言的に作成する。
+#
+# Job は通常リソースとして置き、syncOption Replace=true + Force=true で sync の
+# たびに delete & recreate する (Job は immutable なため)。hook 方式は hook のみの
+# Application で確実に実行されないことがあり採用しない。
+#
+# Force=true が必須: Replace=true 単体は in-place の `kubectl replace` 止まりで、
+# Job が自動付与する spec.selector / controller-uid ラベルを持たない manifest では
+# "spec.selector: Required value" で必ず失敗する。Force=true で `replace --force`
+# (delete してから create) になり回避できる。
+#
+# seaweedfs (chart) 本体とは別 Application。chart Application に raw manifest を
+# 混在できないため分離している。
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: seaweedfs-buckets
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+    targetRevision: main
+    path: manifests/seaweedfs
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: seaweedfs
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # Job は immutable なので Replace + Force で delete & recreate する。
+      # (Replace と ServerSideApply は併用できないため ServerSideApply は付けない)
+      - Replace=true
+      - Force=true

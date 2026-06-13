@@ -1,0 +1,76 @@
+# quality-agent ポリシ (しきい値). docs/quality-model.md「スコアモデル方針」参照.
+# プロジェクト単位で policies/<project>.yaml に分けて Git 管理する。
+name: default
+
+# severity 別の CVE 重み. 加重 CVE 数 = Σ(件数 × 重み) をスコア化する。
+severity_weights:
+  critical: 10.0
+  high: 5.0
+  medium: 1.0
+  low: 0.1
+  unknown: 1.0
+
+# 特性別の正規化しきい値. good で 100 点, bad で 0 点。
+# security は加重 CVE 数を log スケールで補間する (0 件=100, 多いほど 0)。
+# NOTE: ベースイメージ (argocd/grafana/prometheus 等) 由来の既知 CVE が累積する
+# ため、k3d 全 ns スキャンの加重 CVE 数は数万規模になる。絶対値の高低より
+# 「時系列の相対変化」を見る設計 (docs/quality-model.md) なので、bad はクランプ
+# 域に張り付かない大きめの値にしておく。プロジェクト単位で要チューニング。
+#
+# maintainability は SonarQube の比率系メジャーを linear 補間する。
+# debt_ratio の bad=50 はレーティング E 境界 (>50%)、duplication の 30 は慣例値。
+thresholds:
+  security:
+    good: 0.0
+    bad: 100000.0
+  # Macaron の SLSA check 通過率 (0-100, 高いほど良い) の恒等補間。
+  # security スコアは CVE サブスコアとこれの平均になる (パーツ平均方式)。
+  # ローカル Forgejo + CI 無しの現状は provenance 系が全 FAILED のため低空飛行が
+  # 想定値 (2026-06: 15% 前後)。CI/provenance 整備の進捗を時系列で追う指標。
+  security.slsa:
+    good: 100.0
+    bad: 0.0
+  maintainability.debt_ratio:
+    good: 0.0
+    bad: 50.0
+  maintainability.duplication:
+    good: 0.0
+    bad: 30.0
+  # kube-linter 指摘件数 (linear)。自作 manifests は数十オブジェクト規模なので
+  # この程度で 0 点に張り付く想定。件数が育ったら要調整。
+  reliability.lint:
+    good: 0.0
+    bad: 20.0
+  performance.lint:
+    good: 0.0
+    bad: 10.0
+  safety.lint:
+    good: 0.0
+    bad: 20.0
+  # interaction は Ollama の LLM 採点 (0-100, 高いほど良い) をそのまま使う恒等補間。
+  # 採点が甘いと感じたら good を下げて再較正する (例 good: 90 で 90 点を満点扱い)。
+  interaction.doc:
+    good: 100.0
+    bad: 0.0
+  # QiU (forgejo collector の Issue/PR メトリクス, linear)。
+  # クローズ 30 日 / マージ 14 日で 0 点は個人運用の体感値。クローズ率は
+  # 「高いほど良い」向きの恒等補間 (good > bad で逆向き補間になる)。
+  beneficialness.issue_close_days:
+    good: 0.0
+    bad: 30.0
+  acceptability.issue_close_rate:
+    good: 100.0
+    bad: 0.0
+  acceptability.pr_merge_days:
+    good: 0.0
+    bad: 14.0
+
+# サンプル数の下限. これ未満は "insufficient data" として総合から除外。
+min_samples: 1
+
+# 特性別の下限上書き。QiU 系は Issue/PR 件数が少ないと過剰反応するため
+# 5 件未満は insufficient data に倒す (docs/quality-model.md の件数下限の方針。
+# 流量が育ったら 10 などへ引き上げる)。
+min_samples_per_characteristic:
+  beneficialness: 5
+  acceptability: 5

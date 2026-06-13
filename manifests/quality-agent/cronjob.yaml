@@ -1,0 +1,195 @@
+# quality-agent の nightly 評価 CronJob。
+#
+# collect -> analyze -> score -> report --to-postgres を 1 コンテナで実行する。
+# - trivy collector は in-cluster の kubectl で VulnerabilityReport を読む (SA + RBAC)。
+# - sonarqube collector は Web API で保守性メジャーを読む。SONARQUBE_TOKEN が
+#   未投入 (SealedSecret sonarqube-token 未作成) の間は warning を出してこの
+#   source だけスキップする (docs/runbooks/sonarqube-scan.md)。解析結果自体は
+#   sonar-scan-nightly (05:15) が毎晩更新する。
+# - kubelinter collector は initContainer が clone したリポジトリの manifests/ を
+#   イメージ同梱の kube-linter で検査する (reliability/performance/safety)。
+#   clone は forgejo-read SealedSecret (optional) を使い、未投入時は collector が
+#   warning を出してスキップする。
+# - ollama collector は clone 済みリポジトリの README + docs/**/*.md を Windows
+#   ネイティブ Ollama の LLM-as-judge で採点する (interaction)。接続情報は同 ns の
+#   ollama-external ConfigMap (optional)。Ollama 停止中や ConfigMap 未投入時は
+#   collector が warning を出してスキップする。
+# - forgejo collector は Forgejo API から Issue/PR メタデータを読み 25019 QiU
+#   (beneficialness/acceptability) を集計する。PAT は forgejo-read を流用するが
+#   read:repository に加えて read:issue スコープが必要。スコープ不足・未投入時は
+#   collector が warning を出してスキップする。
+# - macaron collector は macaron initContainer (ghcr.io/oracle/macaron) が clone 済み
+#   リポジトリを SLSA 監査したレポート JSON (/src/reports) を読む (security の
+#   耐性サブ特性)。Forgejo は非対応 git service のため macaron-defaults ConfigMap の
+#   [git_service.local_repo] エスケープハッチでローカル解析する。initContainer の
+#   失敗・スキップ時はレポートが無いので collector が warning を出してスキップする。
+# - スコアは pg-main の quality DB に時系列保存する (PG* env、password は SealedSecret)。
+#   起動時に冪等適用する schema.sql は、Grafana datasource 用の読み取り専用ロール
+#   quality_ro への SELECT GRANT も行う (Phase 5、docs/runbooks/quality-observability.md)。
+# イメージは Forgejo レジストリ (forgejo.local.test/sakai/quality-agent) から pull。
+# パッケージは public 公開のため imagePullSecret は不要 (匿名 pull)。
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: quality-agent-nightly
+  namespace: quality-agent
+spec:
+  schedule: "0 6 * * *"
+  timeZone: Asia/Tokyo
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          serviceAccountName: quality-agent
+          restartPolicy: Never
+          volumes:
+            - name: src
+              emptyDir: {}
+            - name: macaron-defaults
+              configMap:
+                name: macaron-defaults
+          initContainers:
+            - name: clone
+              image: alpine/git:v2.52.0
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  if [ -z "$FORGEJO_PAT" ]; then
+                    echo "FORGEJO_PAT 未投入のため clone をスキップ (kubelinter は collector 側で skip される)"
+                    exit 0
+                  fi
+                  git clone --quiet --depth 1 \
+                    "http://sakai:${FORGEJO_PAT}@forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git" \
+                    /src/repo
+                  # PAT を .git/config に残さない
+                  git -C /src/repo remote set-url origin \
+                    http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+              env:
+                - name: FORGEJO_PAT
+                  valueFrom:
+                    secretKeyRef:
+                      name: forgejo-read
+                      key: pat
+                      optional: true
+              volumeMounts:
+                - name: src
+                  mountPath: /src
+            # SLSA 監査。src ボリュームを /home/macaron/output にマウントするので
+            # clone した /src/repo は repo として見え、レポートは /src/reports に出る。
+            # イメージの entrypoint (user.sh) は UID 調整用なので bypass し、venv を
+            # 直接 activate して実行する。解析失敗では Job を落とさない (exit 0)。
+            - name: macaron
+              image: ghcr.io/oracle/macaron:v0.24.0
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  if [ ! -d /home/macaron/output/repo/.git ]; then
+                    echo "リポジトリ未 clone のため macaron をスキップ (collector 側で skip される)"
+                    exit 0
+                  fi
+                  cd /home/macaron && . .venv/bin/activate \
+                    && macaron --local-repos-path /home/macaron/output \
+                         --defaults-path /home/macaron/defaults/defaults.ini \
+                         analyze --repo-path repo --deps-depth 0 \
+                    || echo "warning: macaron 解析に失敗 (collector 側で skip される)"
+              env:
+                # 起動時の非空チェック用ダミー。local_repo 解析では GitHub に接続しない
+                - name: GITHUB_TOKEN
+                  value: unused-local-analysis
+              volumeMounts:
+                - name: src
+                  mountPath: /home/macaron/output
+                - name: macaron-defaults
+                  mountPath: /home/macaron/defaults
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: "1"
+                  memory: 2Gi
+          containers:
+            - name: quality-agent
+              image: forgejo.local.test/sakai/quality-agent:0.6.1
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  quality-agent collect --target local-infra \
+                    --sources trivy,sonarqube,kubelinter,ollama,forgejo,macaron \
+                    --kubelinter-path /src/repo/manifests \
+                    --ollama-docs-path /src/repo \
+                    --macaron-report /src/reports \
+                    --out /tmp/collection.json
+                  quality-agent analyze --in /tmp/collection.json --out /tmp/analysis.json
+                  quality-agent score --in /tmp/analysis.json \
+                    --context contexts/home-monitoring-app.yaml \
+                    --policy policies/default.yaml \
+                    --out /tmp/scores.json
+                  quality-agent report --in /tmp/scores.json --analysis /tmp/analysis.json --to-postgres
+              env:
+                - name: SONARQUBE_URL
+                  value: http://sonarqube-sonarqube.sonarqube.svc.cluster.local:9000
+                # Ollama 接続情報は ollama-external ConfigMap (同 ns) に集約。
+                # optional: ConfigMap 未 sync でも pod を起動させ collector 側で skip
+                - name: OLLAMA_BASE_URL
+                  valueFrom:
+                    configMapKeyRef:
+                      name: ollama-external
+                      key: OLLAMA_BASE_URL
+                      optional: true
+                - name: OLLAMA_MODEL
+                  valueFrom:
+                    configMapKeyRef:
+                      name: ollama-external
+                      key: OLLAMA_MODEL
+                      optional: true
+                - name: SONARQUBE_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: sonarqube-token
+                      key: token
+                      optional: true
+                # Issue/PR メタデータ読み取り (clone と同じ forgejo-read を流用)
+                - name: FORGEJO_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: forgejo-read
+                      key: pat
+                      optional: true
+                - name: PGHOST
+                  value: pg-main-rw.postgres.svc.cluster.local
+                - name: PGPORT
+                  value: "5432"
+                - name: PGUSER
+                  value: quality
+                - name: PGDATABASE
+                  value: quality
+                - name: PGSSLMODE
+                  value: require
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: quality-pg
+                      key: password
+              volumeMounts:
+                - name: src
+                  mountPath: /src
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi

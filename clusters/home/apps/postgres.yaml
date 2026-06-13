@@ -1,0 +1,30 @@
+# Shared PostgreSQL Cluster Application.
+#
+# The Cluster CR itself is a raw manifest at manifests/postgres/cluster.yaml,
+# not a Helm chart. Future additions (Database / Backup / ScheduledBackup CRs)
+# go into the same directory.
+#
+# prune disabled: never accidentally drop the shared database cluster from a
+# Git accident. Manual `kubectl delete` is required if we truly want to remove.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: postgres
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+    targetRevision: main
+    path: manifests/postgres
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: postgres
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

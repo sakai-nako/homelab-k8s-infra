@@ -1,0 +1,252 @@
+# 品質スコア時系列ダッシュボード (Phase 5)。
+#
+# label grafana_dashboard=1 を Grafana の dashboard sidecar (NAMESPACE=ALL) が
+# 検出して自動 provisioning する。データソースは uid=quality-postgres
+# (charts/monitoring/values.yaml の additionalDataSources) 固定参照。
+#
+# この ConfigMap が真実 (source of truth)。Grafana UI での編集は保存できず、
+# 「Save as」コピーは drift の元なので作らない。変更フローは
+# docs/runbooks/quality-observability.md を参照 (UI で編集 → JSON export →
+# ここに反映 → git push)。
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: quality-scores-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  quality-scores.json: |
+    {
+      "uid": "quality-scores",
+      "title": "Quality Scores (ISO 25010/25019)",
+      "tags": ["quality", "iso25010", "iso25019"],
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "editable": true,
+      "graphTooltip": 1,
+      "time": {"from": "now-30d", "to": "now"},
+      "refresh": "",
+      "templating": {
+        "list": [
+          {
+            "name": "target",
+            "label": "target",
+            "type": "query",
+            "datasource": {"type": "postgres", "uid": "quality-postgres"},
+            "query": "SELECT DISTINCT target FROM quality_runs ORDER BY 1;",
+            "refresh": 1,
+            "current": {"text": "local-infra", "value": "local-infra"},
+            "includeAll": false,
+            "multi": false
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 1,
+          "type": "stat",
+          "title": "総合スコア (最新 run)",
+          "datasource": {"type": "postgres", "uid": "quality-postgres"},
+          "gridPos": {"h": 6, "w": 6, "x": 0, "y": 0},
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {"type": "postgres", "uid": "quality-postgres"},
+              "format": "table",
+              "rawQuery": true,
+              "rawSql": "SELECT overall FROM quality_runs WHERE target = '$target' ORDER BY scored_at DESC LIMIT 1;"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "min": 0,
+              "max": 100,
+              "decimals": 1,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {"color": "red", "value": null},
+                  {"color": "yellow", "value": 50},
+                  {"color": "green", "value": 70}
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "graphMode": "none",
+            "colorMode": "value",
+            "textMode": "value"
+          }
+        },
+        {
+          "id": 2,
+          "type": "stat",
+          "title": "最終 run からの経過時間",
+          "description": "nightly は毎日 06:00 JST。30h を超えたら quality-run-stale アラートが発火する",
+          "datasource": {"type": "postgres", "uid": "quality-postgres"},
+          "gridPos": {"h": 6, "w": 6, "x": 6, "y": 0},
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {"type": "postgres", "uid": "quality-postgres"},
+              "format": "table",
+              "rawQuery": true,
+              "rawSql": "SELECT EXTRACT(EPOCH FROM (now() - MAX(scored_at))) / 3600.0 AS hours_since_last_run FROM quality_runs WHERE target = '$target';"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "h",
+              "decimals": 1,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {"color": "green", "value": null},
+                  {"color": "yellow", "value": 24},
+                  {"color": "red", "value": 30}
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "graphMode": "none",
+            "colorMode": "value",
+            "textMode": "value"
+          }
+        },
+        {
+          "id": 3,
+          "type": "table",
+          "title": "最新 run の特性内訳",
+          "description": "insufficient_data=true の特性は重み付け対象外 (記録のみ)",
+          "datasource": {"type": "postgres", "uid": "quality-postgres"},
+          "gridPos": {"h": 12, "w": 12, "x": 12, "y": 0},
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {"type": "postgres", "uid": "quality-postgres"},
+              "format": "table",
+              "rawQuery": true,
+              "rawSql": "SELECT s.characteristic, s.score, s.weight, s.insufficient_data FROM quality_characteristic_scores s WHERE s.run_id = (SELECT run_id FROM quality_runs WHERE target = '$target' ORDER BY scored_at DESC LIMIT 1) ORDER BY s.characteristic;"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": [
+              {
+                "matcher": {"id": "byName", "options": "score"},
+                "properties": [
+                  {"id": "custom.cellOptions", "value": {"type": "color-text"}},
+                  {
+                    "id": "thresholds",
+                    "value": {
+                      "mode": "absolute",
+                      "steps": [
+                        {"color": "red", "value": null},
+                        {"color": "yellow", "value": 50},
+                        {"color": "green", "value": 70}
+                      ]
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {"id": "byName", "options": "insufficient_data"},
+                "properties": [
+                  {"id": "custom.cellOptions", "value": {"type": "color-text"}},
+                  {
+                    "id": "mappings",
+                    "value": [
+                      {
+                        "type": "value",
+                        "options": {
+                          "true": {"color": "orange", "index": 0},
+                          "false": {"color": "green", "index": 1}
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {"showHeader": true}
+        },
+        {
+          "id": 4,
+          "type": "timeseries",
+          "title": "総合スコア推移",
+          "datasource": {"type": "postgres", "uid": "quality-postgres"},
+          "gridPos": {"h": 6, "w": 12, "x": 0, "y": 6},
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {"type": "postgres", "uid": "quality-postgres"},
+              "format": "time_series",
+              "rawQuery": true,
+              "rawSql": "SELECT scored_at AS \"time\", overall FROM quality_runs WHERE target = '$target' AND $__timeFilter(scored_at) ORDER BY 1;"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "min": 0,
+              "max": 100,
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "always",
+                "pointSize": 6,
+                "spanNulls": true
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {"displayMode": "list", "placement": "bottom"},
+            "tooltip": {"mode": "multi"}
+          }
+        },
+        {
+          "id": 5,
+          "type": "timeseries",
+          "title": "特性別スコア推移 (8 特性)",
+          "datasource": {"type": "postgres", "uid": "quality-postgres"},
+          "gridPos": {"h": 10, "w": 24, "x": 0, "y": 12},
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {"type": "postgres", "uid": "quality-postgres"},
+              "format": "time_series",
+              "rawQuery": true,
+              "rawSql": "SELECT r.scored_at AS \"time\", s.characteristic AS metric, s.score FROM quality_characteristic_scores s JOIN quality_runs r USING (run_id) WHERE r.target = '$target' AND $__timeFilter(r.scored_at) ORDER BY 1;"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "min": 0,
+              "max": 100,
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 0,
+                "showPoints": "always",
+                "pointSize": 5,
+                "spanNulls": true
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull"]},
+            "tooltip": {"mode": "multi"}
+          }
+        }
+      ]
+    }

@@ -1,0 +1,127 @@
+# pg-main 全 DB の論理ダンプ CronJob (層 1、docs/backup.md)。
+#
+# pg_dumpall でロール定義込みの全 DB (forgejo/grafana/sonarqube/quality) を
+# sql.gz として NAS へ退避する。Windows から直接読める形式 (Recoverable 原則)。
+# 復元手順は docs/runbooks/disaster-recovery.md。
+#
+# - 接続は pg-main-superuser Secret (cluster.yaml の enableSuperuserAccess: true で
+#   CNPG が自動生成)。pg_dumpall はロール/権限のダンプに superuser が必要。
+# - 検証は月次の backup-restore-test CronJob (restore-test-cronjob.yaml) が行う。
+# - 失敗は KubeJobFailed アラート → am-forgejo-bridge → Forgejo Issue 起票。
+# - NAS 書き込み可否を pre-check し SMB 断を早期顕在化 (velero-export と同パターン)。
+# - NAS (cifs, uid=1000) へ書けるよう runAsUser 1000 で動かす。
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-dump
+  namespace: postgres
+spec:
+  # 層 1 は 03:00 台 (forgejo 03:00 → postgres 03:15 → 鍵 03:45)、層 2 はその後。
+  schedule: "15 3 * * *"
+  timeZone: Asia/Tokyo
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Job の整理は successful/failedJobsHistoryLimit に任せる (ttl は併用しない)。
+      # 失敗 Job は新しい失敗 3 件で押し出されるまで残り、その間 KubeJobFailed が
+      # firing し続ける = Forgejo Issue が解決まで開き続ける (意図した挙動)。
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: dump
+              # サーバと同じメジャーバージョンの pg_dumpall を使う (cluster.yaml と揃える)
+              image: ghcr.io/cloudnative-pg/postgresql:17.2
+              env:
+                - name: PGHOST
+                  value: pg-main-rw.postgres.svc.cluster.local
+                - name: PGPORT
+                  value: "5432"
+                - name: PGUSER
+                  valueFrom:
+                    secretKeyRef:
+                      name: pg-main-superuser
+                      key: username
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: pg-main-superuser
+                      key: password
+                - name: PGSSLMODE
+                  value: require
+                - name: NAS_DIR
+                  value: /mnt/nas/local-infra-backups/logical/postgres
+                - name: RETAIN_DAYS
+                  value: "14"
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+
+                  # --- NAS 書き込み可否 pre-check (SMB 断を早期検知) ---
+                  mkdir -p "$NAS_DIR"
+                  if ! touch "$NAS_DIR/.write-test" 2>/dev/null; then
+                    echo "FATAL: $NAS_DIR is not writable (NAS マウント断?)" >&2
+                    exit 1
+                  fi
+                  rm -f "$NAS_DIR/.write-test"
+
+                  TS=$(date -u +%Y-%m-%dT%H%M%SZ)
+                  OUT="$NAS_DIR/pg-main-${TS}.sql.gz"
+
+                  # --clean --if-exists: 復元先に残骸があっても流し込める形にする
+                  echo "dumping all databases from $PGHOST ..."
+                  pg_dumpall --clean --if-exists | gzip > "${OUT}.partial"
+
+                  # --- 健全性チェック: gzip 整合性と最低サイズ ---
+                  gzip -t "${OUT}.partial"
+                  SIZE=$(stat -c %s "${OUT}.partial")
+                  if [ "$SIZE" -lt 10240 ]; then
+                    echo "FATAL: dump too small (${SIZE} bytes)" >&2
+                    exit 1
+                  fi
+                  mv "${OUT}.partial" "$OUT"
+
+                  echo "pruning dumps older than ${RETAIN_DAYS} days ..."
+                  find "$NAS_DIR" -name 'pg-main-*.sql.gz' -mtime +"$RETAIN_DAYS" -delete
+                  find "$NAS_DIR" -name 'pg-main-*.sql.gz.partial' -mtime +1 -delete
+
+                  echo "done:"
+                  ls -lh "$OUT"
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: nas
+                  mountPath: /mnt/nas
+                - name: tmp
+                  mountPath: /tmp
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+          volumes:
+            # NAS は k3d 全ノードに hostPath bind mount 済 (bootstrap/01-k3d-cluster.yaml)
+            - name: nas
+              hostPath:
+                path: /mnt/nas
+                type: Directory
+            - name: tmp
+              emptyDir: {}

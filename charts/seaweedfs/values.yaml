@@ -1,0 +1,100 @@
+# SeaweedFS values for local-infra home cluster.
+#
+# Chart: seaweedfs/seaweedfs (https://seaweedfs.github.io/seaweedfs/helm)
+# Referenced by clusters/home/apps/seaweedfs.yaml
+#
+# 役割: S3 互換オブジェクトストレージ。後続フェーズで Velero のバックアップ先 /
+#       Forgejo LFS の backend として使う「補助層」。
+#
+# 永続化方針 (2026-05-29 決定):
+#   master / volume / filer すべて local-path (WSL2 ext4) PVC に置く。
+#   理由: SeaweedFS は独自フォーマット (.dat/.idx + leveldb メタ) なので /mnt/nas に
+#         直接置いても Windows から読めず「丸ごと tar.gz」の旨味が薄い。それより
+#         SMB 非依存で起動を安定させ、本当に必要な中身は S3 API 層
+#         (aws s3 sync / weed filer.backup) で /mnt/nas へ tar.gz エクスポートする
+#         2 層構成にする。容量が WSL2 ディスクで不足したら csi-driver-smb 移行後に
+#         PVC を SMB-backed StorageClass へ差し替える。
+#
+# レプリケーション: 単一 volume server (replicas:1) のため複製なし (デフォルト 000)。
+
+# --- Master: volume のトポロジ情報を保持 ---
+master:
+  enabled: true
+  replicas: 1
+  data:
+    type: "persistentVolumeClaim"
+    size: "1Gi"
+    storageClass: "local-path"
+  logs:
+    type: "emptyDir"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+# --- Volume: オブジェクトの実データ (.dat / .idx) ---
+volume:
+  enabled: true
+  replicas: 1
+  dataDirs:
+    - name: data1
+      type: "persistentVolumeClaim"
+      size: "20Gi"
+      storageClass: "local-path"
+      maxVolumes: 0
+  # idx は指定なし → dataDir に同居 (.dat と .idx をペアで持つ)
+  idx: {}
+  logs:
+    type: "emptyDir"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# --- Filer: ファイル/ディレクトリのメタデータ (leveldb2) + S3 gateway 同居 ---
+filer:
+  enabled: true
+  replicas: 1
+  data:
+    type: "persistentVolumeClaim"
+    size: "1Gi"
+    storageClass: "local-path"
+  logs:
+    type: "emptyDir"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      # 256Mi では velero-s3-nas-export の連続 GET ストリーミングで OOMKill が頻発
+      # (2026-06、バケット ~1.7GiB 時点で restart 233 回)。4.29 は idle だけで 545Mi
+      # 食うリグレッション (上流 issue #9035) があり 1Gi でも GET 開始 21 秒で OOM。
+      # Velero TTL 30d 満杯時の ~4.5GiB バケットの export に耐える余裕を見て 2Gi。
+      memory: 2Gi
+  # Go ランタイムは cgroup の memory limit を認識しないため、GOMEMLIMIT で
+  # GC にヒープ上限を教える (limit の ~85%)。これが無いと S3 GET ストリーミング中の
+  # ヒープスパイクが GC より先に cgroup limit を突き抜けて OOMKill される
+  # (1Gi へ増量しても起動 99 秒で OOMKill した実績あり)。
+  # 注: chart デフォルトの extraEnvironmentVars (WEED_LEVELDB2_ENABLED 等) は
+  # Helm の deep merge で維持される。
+  extraEnvironmentVars:
+    GOMEMLIMIT: "1750MiB"
+  # S3 API を filer に同居させる (独立 s3 deployment より 1 ポッド省ける)
+  s3:
+    enabled: true
+    port: 8333
+    enableAuth: true
+    # seaweedfs_s3_config キーに identities JSON を持つ SealedSecret。
+    # secrets/seaweedfs-s3.yaml → sealed-secrets controller が復号して生成する。
+    existingConfigSecret: seaweedfs-s3
+
+# --- 独立 S3 deployment は使わない (filer.s3 に同居させたため) ---
+s3:
+  enabled: false

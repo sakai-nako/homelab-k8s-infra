@@ -1,0 +1,257 @@
+# kube-prometheus-stack values for local-infra home cluster.
+#
+# Chart: prometheus-community/kube-prometheus-stack 86.1.0 (prometheus-operator v0.91.0)
+# Referenced by clusters/home/apps/monitoring.yaml (multi-source `$values` パターン)
+#
+# 役割 (docs/architecture.md「監視戦略」):
+#   - Prometheus: クラスタメトリクス + 各アプリの /metrics を scrape
+#   - Grafana: 標準ダッシュボード (Kubernetes / Node Exporter)。バックエンド DB は pg-main 共用
+#   - Alertmanager: クラスタ障害アラート (quality 劣化 + バックアップ系 Job 失敗は
+#     am-forgejo-bridge 経由で Forgejo Issue 自動起票。Phase 6)
+#
+# 重要な設計判断:
+# - Grafana の backend DB は内蔵 SQLite ではなく pg-main (CNPG) の grafana DB を使う。
+#   password は grafana-pg SealedSecret (monitoring ns) から GF_DATABASE_PASSWORD env で注入。
+# - 永続化は全て local-path PVC (SMB 非依存方針)。
+# - UI は grafana/prometheus/alertmanager の 3 つとも Traefik ingress で *.local.test 公開。
+# - CRD が巨大なため ArgoCD App 側で ServerSideApply=true 必須 (annotation 超過回避)。
+
+# ---- Grafana ----
+grafana:
+  # admin 認証情報は grafana-admin SealedSecret (monitoring ns) から
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+
+  # backend DB を pg-main の grafana DB に (SQLite を使わない)。
+  # password は grafana.ini に書かず、GF_DATABASE_PASSWORD env (下の envValueFrom) で供給する。
+  grafana.ini:
+    database:
+      type: postgres
+      host: pg-main-rw.postgres.svc.cluster.local:5432
+      name: grafana
+      user: grafana
+      ssl_mode: require
+
+  # GF_<SECTION>_<KEY> 形式の env は grafana.ini を上書きする。password だけ Secret から注入。
+  # QUALITY_PG_PASSWORD は GF_ 形式ではないので grafana.ini には影響せず、
+  # additionalDataSources の $__env{...} 展開でのみ使われる。
+  envValueFrom:
+    GF_DATABASE_PASSWORD:
+      secretKeyRef:
+        name: grafana-pg
+        key: password
+    QUALITY_PG_PASSWORD:
+      secretKeyRef:
+        name: quality-ro-pg
+        key: password
+
+  # quality-agent のスコア時系列 (pg-main の quality DB) を読む datasource (Phase 5)。
+  # 接続ロールは読み取り専用の quality_ro (GRANT は quality-agent の schema.sql が冪等適用)。
+  # uid はダッシュボード/アラートルールの ConfigMap (manifests/monitoring-quality/) から
+  # 固定参照されるため変更しないこと。
+  additionalDataSources:
+    - name: Quality (PostgreSQL)
+      uid: quality-postgres
+      type: postgres
+      access: proxy
+      url: pg-main-rw.postgres.svc.cluster.local:5432
+      user: quality_ro
+      editable: false
+      jsonData:
+        database: quality
+        sslmode: require
+        maxOpenConns: 4
+      secureJsonData:
+        password: $__env{QUALITY_PG_PASSWORD}
+
+  # sidecar.alerts: manifests/monitoring-quality/ のアラートルール・通知設定 ConfigMap
+  # (label grafana_alert) を取り込む。searchNamespace 既定 = 自 ns (monitoring) のみ。
+  #
+  # Grafana-managed アラート → 既存 Alertmanager の転送は、datasource の
+  # handleGrafanaManagedAlerts では行わない (org の ngalert admin config レコードが
+  # 無いと external AM discovery が走らず、admin config は file provisioning 不可 =
+  # GitOps 化できないため)。代わりに manifests/monitoring-quality/alert-rules.yaml の
+  # contact point (prometheus-alertmanager 型) + root notification policy で送る。
+  sidecar:
+    alerts:
+      enabled: true
+
+  # backend が PostgreSQL なので Grafana 自身の PVC は不要
+  persistence:
+    enabled: false
+
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hosts:
+      - grafana.local.test
+    path: /
+    pathType: Prefix
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# ---- Prometheus ----
+prometheus:
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hosts:
+      - prometheus.local.test
+    paths:
+      - /
+    pathType: Prefix
+  prometheusSpec:
+    retention: 15d
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 10Gi
+    resources:
+      requests:
+        cpu: 200m
+        memory: 1Gi
+      limits:
+        cpu: "1"
+        memory: 3Gi
+
+# ---- Alertmanager ----
+alertmanager:
+  # config はチャートのデフォルト全体を置き換えるため、デフォルトの
+  # inhibit_rules / Watchdog null route / templates をそのまま再掲した上で
+  # forgejo-issues receiver (am-forgejo-bridge への webhook) を追加している (Phase 6)。
+  # 起票対象:
+  #   1) source=quality-agent — Grafana-managed の品質劣化アラート 4 本
+  #      (manifests/monitoring-quality/alert-rules.yaml)。ルール単位で 1 Issue。
+  #   2) KubeJobFailed (バックアップ/評価系 namespace のみ) — 論理ダンプ・
+  #      restore テスト・velero-export・quality nightly の失敗検知。ns 単位で 1 Issue。
+  #      失敗 Job の削除 (または ttl/history limit による自動整理) で resolve →
+  #      Issue は自動クローズされる。
+  # bridge は repeat_interval の再通知を吸収する (firing 集合が同じなら no-op) ので
+  # Issue がコメントで溢れることはない。
+  config:
+    global:
+      resolve_timeout: 5m
+    inhibit_rules:
+      - source_matchers:
+          - 'severity = critical'
+        target_matchers:
+          - 'severity =~ warning|info'
+        equal:
+          - 'namespace'
+          - 'alertname'
+      - source_matchers:
+          - 'severity = warning'
+        target_matchers:
+          - 'severity = info'
+        equal:
+          - 'namespace'
+          - 'alertname'
+      - source_matchers:
+          - 'alertname = InfoInhibitor'
+        target_matchers:
+          - 'severity = info'
+        equal:
+          - 'namespace'
+      - target_matchers:
+          - 'alertname = InfoInhibitor'
+    route:
+      group_by: ['namespace']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 12h
+      receiver: 'null'
+      routes:
+        - receiver: 'null'
+          matchers:
+            - alertname = "Watchdog"
+        - receiver: forgejo-issues
+          matchers:
+            - source = "quality-agent"
+          group_by: ['alertname']
+          group_wait: 1m
+          group_interval: 10m
+          repeat_interval: 24h
+        - receiver: forgejo-issues
+          matchers:
+            - alertname = "KubeJobFailed"
+            - namespace =~ "backups|forgejo|postgres|quality-agent|sealed-secrets|seaweedfs|velero"
+          group_by: ['namespace']
+          group_wait: 5m
+          group_interval: 30m
+          repeat_interval: 24h
+    receivers:
+      - name: 'null'
+      - name: forgejo-issues
+        webhook_configs:
+          - url: http://am-forgejo-bridge.monitoring.svc.cluster.local:8080/alerts
+            send_resolved: true
+            max_alerts: 50
+    templates:
+      - '/etc/alertmanager/config/*.tmpl'
+
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hosts:
+      - alertmanager.local.test
+    paths:
+      - /
+    pathType: Prefix
+  alertmanagerSpec:
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 2Gi
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+
+# ---- Operator / exporters ----
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 300m
+      memory: 256Mi
+
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 192Mi
+
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi

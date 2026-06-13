@@ -1,0 +1,98 @@
+# ArgoCD Helm values for local-infra home cluster.
+#
+# Chart: argo/argo-cd (https://argoproj.github.io/argo-helm)
+# Referenced by:
+#   - bootstrap/03-argocd-install.md (manual helm install)
+#   - clusters/home/apps/argocd.yaml (ArgoCD self-managed Application, Phase 2)
+#
+# Both must use this file unmodified so ArgoCD self-heal converges cleanly.
+#
+# TLS strategy: Phase 1 runs ArgoCD over plain HTTP via Traefik. Phase 2 may
+# add cert-manager + self-signed CA for *.local.test TLS termination.
+
+global:
+  domain: argocd.local.test
+
+# ArgoCD server: HTTP only (TLS not terminated by ArgoCD itself).
+# `server.insecure: true` makes argocd-server listen on plain HTTP.
+configs:
+  params:
+    server.insecure: true
+  cm:
+    # Allow Helm value files referenced from Application manifests.
+    helm.enabled: "true"
+    # Allow Kustomize.
+    kustomize.enabled: "true"
+    # URL displayed for outbound links from the UI.
+    url: http://argocd.local.test
+    # Use Forgejo for repo URLs from the UI.
+    statusbadge.enabled: "true"
+    # Polling interval for Git repo changes. Default is 180s (production-safe).
+    # Local single-user cluster — short interval is fine and improves UX.
+    timeout.reconciliation: 30s
+    timeout.reconciliation.jitter: 5s
+  rbac:
+    # Default policy: anonymous gets no access. Logged-in admin gets full.
+    policy.default: ""
+
+server:
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hostname: argocd.local.test
+    paths:
+      - /
+    pathType: Prefix
+    annotations:
+      traefik.ingress.kubernetes.io/router.entrypoints: web
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+repoServer:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+applicationSet:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+controller:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+dex:
+  # Phase 1 では SSO 不要なので無効化
+  enabled: false
+
+redis:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+notifications:
+  # Phase 5 で alert 通知に使う予定。Phase 1 は無効
+  enabled: false

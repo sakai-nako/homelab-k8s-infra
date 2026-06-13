@@ -1,0 +1,21 @@
+# SonarQube 用データベース (CloudNativePG Database CR、宣言的)。
+#
+# pg-main 上に sonarqube DB を作成し owner を sonarqube role に。role 自体は
+# cluster.yaml の spec.managed.roles[sonarqube] で管理 (password は sonarqube-pg SealedSecret)。
+# SonarQube CE は charts/sonarqube/values.yaml の jdbcOverwrite で
+# pg-main-rw.postgres.svc に外部接続する (内蔵 DB は使わない)。
+#
+# databaseReclaimPolicy: retain — Database CR を消しても実 DB は残す (データ保護)。
+
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: sonarqube
+  namespace: postgres
+spec:
+  name: sonarqube
+  owner: sonarqube
+  cluster:
+    name: pg-main
+  ensure: present
+  databaseReclaimPolicy: retain

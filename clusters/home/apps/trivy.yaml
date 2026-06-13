@@ -1,0 +1,37 @@
+# trivy-operator Application managed by ArgoCD.
+#
+#   - Chart: aqua/trivy-operator (aquasecurity helm repo)。
+#   - values.yaml は本リポジトリから読む (multi-source `$values` パターン)。
+#   - ServerSideApply=true: CRD (vulnerabilityreports 等) を含むため client-side apply の
+#     annotation 肥大を避ける。
+#
+# 依存: なし (DB / Secret 不要)。メトリクス連携先として monitoring (kube-prometheus-stack) が
+#       先に居ると ServiceMonitor が即 scrape される (無くても CRD 生成は動く)。
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: trivy
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: https://aquasecurity.github.io/helm-charts
+      chart: trivy-operator
+      targetRevision: 0.32.1
+      helm:
+        valueFiles:
+          - $values/charts/trivy/values.yaml
+    - repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: trivy-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

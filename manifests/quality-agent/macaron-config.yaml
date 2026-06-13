@@ -1,0 +1,16 @@
+# Macaron (SLSA 監査) の設定上書き。
+#
+# Macaron は GitHub / GitLab 以外の git service をネイティブサポートしない。
+# Forgejo のリポジトリは公式のエスケープハッチ [git_service.local_repo] を使い、
+# 「事前に clone 済みのローカルリポジトリ」として解析する (clone は nightly Job の
+# clone initContainer が行う)。hostname には clone 後の origin remote のホスト名
+# (= Forgejo のクラスタ内 Service) を指定する。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: macaron-defaults
+  namespace: quality-agent
+data:
+  defaults.ini: |
+    [git_service.local_repo]
+    hostname = forgejo-http.forgejo.svc.cluster.local

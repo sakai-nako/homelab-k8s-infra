@@ -1,0 +1,38 @@
+# backups: 層 1 論理ダンプ + 月次 restore テスト (Phase 6、docs/backup.md)。
+#
+# manifests/backups/ の CronJob 群を各 namespace へ配る (secrets App と同じく
+# リソース側の metadata.namespace が真実。destination は restore テスト用の
+# backups ns):
+#   - forgejo-dump (forgejo ns, 03:00 JST 日次): forgejo dump → NAS zip
+#   - postgres-dump (postgres ns, 03:15 JST 日次): pg_dumpall → NAS sql.gz
+#   - sealed-secrets-key-backup (sealed-secrets ns, 日曜 03:45 JST):
+#     sealing key 全世代を GPG 暗号化して NAS へ (鍵ローテーション対応)
+#   - backup-restore-test (backups ns, 毎月 1 日 07:00 JST): 最新ダンプを
+#     使い捨て PostgreSQL へ実復元して検証
+#
+# CronJob は通常リソースなので Replace は不要 (immutable Job とは違う)。
+# prune: true — データは NAS 側にあり、リソース自体は消えても再生成可能。
+# 失敗の通知経路: KubeJobFailed → am-forgejo-bridge → Forgejo Issue。
+# 復元手順: docs/runbooks/disaster-recovery.md
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: backups
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+    targetRevision: main
+    path: manifests/backups
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: backups
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

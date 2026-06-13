@@ -1,0 +1,38 @@
+# SonarQube CE Application managed by ArgoCD.
+#
+#   - Chart: sonarqube/sonarqube (SonarSource helm repo)。community.enabled で Community Build。
+#   - values.yaml は本リポジトリから読む (multi-source `$values` パターン、monitoring と同形)。
+#   - ServerSideApply=true: SonarQube chart も比較的大きいため client-side apply の
+#     last-applied annotation 肥大を避ける。
+#
+# 依存: pg-main (sonarqube DB + sonarqube role) + sonarqube-pg / sonarqube-app SealedSecret。
+#       sonarqube ns は本 App が作成し、secrets App による sonarqube ns の SealedSecret 投入は
+#       automated sync で eventual に収束する (monitoring/velero と同じ挙動)。
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sonarqube
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: https://SonarSource.github.io/helm-chart-sonarqube
+      chart: sonarqube
+      targetRevision: 2026.3.0
+      helm:
+        valueFiles:
+          - $values/charts/sonarqube/values.yaml
+    - repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sonarqube
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

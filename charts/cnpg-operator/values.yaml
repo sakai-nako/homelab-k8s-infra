@@ -1,0 +1,43 @@
+# CloudNativePG Operator values for local-infra home cluster.
+#
+# Chart: cnpg/cloudnative-pg (https://cloudnative-pg.github.io/charts)
+# Referenced by clusters/home/apps/cnpg-operator.yaml
+#
+# This is the OPERATOR only. PostgreSQL Cluster resources (the actual DB pods)
+# are declared separately under manifests/postgres/cluster.yaml.
+
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 100Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# CRD は Helm chart によって install される (chart デフォルト)。
+# upgrade 時の挙動を制御するためにここで明示。
+crds:
+  create: true
+
+# Prometheus / Grafana integration は kube-prometheus-stack 投入後に有効化
+monitoring:
+  podMonitorEnabled: false
+  grafanaDashboard:
+    create: false
+
+# Admission webhook (デフォルト有効、本番運用の必須機能)
+webhook:
+  port: 9443
+
+# 個人運用のためログレベルは info で十分
+config:
+  data:
+    INHERITED_ANNOTATIONS: categories.local-infra/*
+    INHERITED_LABELS: environment, team
+
+# leader election はシングル replica なら不要だが、operator の標準動作に従う
+nodeSelector: {}
+tolerations: []
+affinity: {}

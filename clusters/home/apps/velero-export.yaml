@@ -1,0 +1,35 @@
+# Velero S3→NAS エクスポート Application (層 2 の最終段)。
+#
+# manifests/velero-export/ の CronJob (velero-s3-nas-export) を velero namespace へ
+# 投入する。SeaweedFS の velero バケットを毎日 S3 API で取得し /mnt/nas へ tar.gz 退避。
+#
+# velero (chart) 本体とは別 Application:
+#   - chart Application に raw manifest を混在できない
+#   - velero chart App は prune: false (BSL/schedule を Git 事故から守る) だが、
+#     こちらは通常リソースなので prune: true + ServerSideApply で素直に同期させる
+# seaweedfs-buckets App (Replace + Force) にも相乗りしない理由は CronJob 側コメント参照。
+#
+# 依存: velero (バケット velero が backup を持つ) + velero-credentials SealedSecret。
+#       いずれも automated sync で収束する。
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: velero-export
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: http://forgejo-http.forgejo.svc.cluster.local:3000/sakai/local-infra.git
+    targetRevision: main
+    path: manifests/velero-export
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: velero
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

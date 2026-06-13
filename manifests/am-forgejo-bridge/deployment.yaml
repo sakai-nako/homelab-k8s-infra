@@ -1,0 +1,96 @@
+# am-forgejo-bridge: Alertmanager webhook → Forgejo Issue 自動起票 (Phase 6)。
+#
+# Alertmanager の receiver `forgejo-issues` (charts/monitoring/values.yaml の
+# alertmanager.config) が POST /alerts に通知を送り、本サービスが
+# sakai/local-infra リポジトリへ Issue を起票/更新/クローズする。
+# 「1 アラートグループ = 1 open Issue」の対応は Issue body 内の
+# HTML コメントマーカーで dedup する (実装は am-forgejo-bridge/)。
+#
+# - PAT は am-forgejo-bridge-token SealedSecret (write:issue スコープ)。
+# - replicas は 1 固定 + Recreate。プロセス内ロックで起票を直列化しているため
+#   多重インスタンスにすると重複起票しうる。
+# - イメージは Forgejo registry から匿名 pull (docs/runbooks/forgejo-registry.md)。
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: am-forgejo-bridge
+  namespace: monitoring
+  labels:
+    app: am-forgejo-bridge
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: am-forgejo-bridge
+  template:
+    metadata:
+      labels:
+        app: am-forgejo-bridge
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bridge
+          image: forgejo.local.test/sakai/am-forgejo-bridge:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: FORGEJO_URL
+              value: http://forgejo-http.forgejo.svc.cluster.local:3000
+            - name: FORGEJO_REPO
+              value: sakai/local-infra
+            - name: FORGEJO_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: am-forgejo-bridge-token
+                  key: token
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: am-forgejo-bridge
+  namespace: monitoring
+  labels:
+    app: am-forgejo-bridge
+spec:
+  type: ClusterIP
+  selector:
+    app: am-forgejo-bridge
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

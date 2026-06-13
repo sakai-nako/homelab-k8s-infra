@@ -1,0 +1,241 @@
+# 品質スコア劣化検知の Grafana-managed アラートルール (Phase 5)。
+#
+# label grafana_alert=1 を Grafana の alerts sidecar (charts/monitoring/values.yaml で
+# 有効化、自 ns のみ監視) が検出して provisioning する。発火したアラートは
+# quality-notifications.yaml の contact point (prometheus-alertmanager 型) + root
+# notification policy により既存の Alertmanager (kube-prometheus-stack) へ送られ、
+# AM の receiver `forgejo-issues` → am-forgejo-bridge が Forgejo Issue を自動起票
+# する (Phase 6。route 定義は charts/monitoring/values.yaml の alertmanager.config)。
+#
+# 注: datasource の handleGrafanaManagedAlerts による転送は、org の ngalert admin
+# config レコードが無いと external AM discovery が走らず機能しない (admin config は
+# file provisioning 不可 = GitOps 化できない)。そのため宣言管理できる contact
+# point + policy 方式を採用している。
+#
+# provisioning 由来のルールは Grafana UI から編集できない (Provisioned バッジ)。
+# 閾値調整は必ずこのファイルを編集して git push する。
+#
+# 閾値の表現について: スコアは NUMERIC(5,1) (0.1 刻み) なので、evaluator に
+# gte が無い代わりに `gt 4.9` ≡ `>= 5.0`、`gt 9.9` ≡ `>= 10.0` で厳密に表せる。
+# スキーマの精度を変えたらここも見直すこと。
+#
+# 運用 runbook: docs/runbooks/quality-observability.md
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: quality-alert-rules
+  namespace: monitoring
+  labels:
+    grafana_alert: "1"
+data:
+  # Grafana-managed アラートを既存 Alertmanager へ送る contact point と root policy。
+  # root policy は Grafana 内蔵 AM の既定 receiver (grafana-default-email) を置き換える
+  # が、Grafana-managed アラートは本リポジトリでは下の 4 ルールだけなので影響範囲は閉じる。
+  quality-notifications.yaml: |
+    apiVersion: 1
+    contactPoints:
+      - orgId: 1
+        name: kps-alertmanager
+        receivers:
+          - uid: kps-alertmanager
+            type: prometheus-alertmanager
+            settings:
+              url: http://monitoring-kube-prometheus-alertmanager.monitoring.svc.cluster.local:9093
+            disableResolveMessage: false
+    policies:
+      - orgId: 1
+        receiver: kps-alertmanager
+        group_by: ['grafana_folder', 'alertname']
+        group_wait: 30s
+        group_interval: 5m
+        repeat_interval: 4h
+  quality-alerts.yaml: |
+    apiVersion: 1
+    groups:
+      - orgId: 1
+        name: quality-degradation
+        folder: Quality
+        interval: 10m
+        rules:
+          # 1) 総合スコアが前回 run 比で 5.0 以上低下
+          - uid: quality-overall-drop
+            title: Quality overall score dropped vs previous run
+            condition: C
+            data:
+              - refId: A
+                relativeTimeRange: {from: 600, to: 0}
+                datasourceUid: quality-postgres
+                model:
+                  refId: A
+                  format: table
+                  rawQuery: true
+                  rawSql: |
+                    WITH ranked AS (
+                      SELECT overall,
+                             ROW_NUMBER() OVER (ORDER BY scored_at DESC) AS rn
+                      FROM quality_runs
+                      WHERE target = 'local-infra'
+                    )
+                    SELECT COALESCE(
+                      (SELECT p.overall - c.overall
+                         FROM ranked c, ranked p
+                        WHERE c.rn = 1 AND p.rn = 2),
+                      0) AS overall_drop;
+              - refId: C
+                relativeTimeRange: {from: 0, to: 0}
+                datasourceUid: __expr__
+                model:
+                  refId: C
+                  type: threshold
+                  datasource: {type: __expr__, uid: __expr__}
+                  expression: A
+                  conditions:
+                    - evaluator: {type: gt, params: [4.9]}
+            noDataState: OK
+            execErrState: Error
+            for: 0s
+            annotations:
+              summary: "総合スコアが前回 run 比で {{ $values.A }} ポイント低下した"
+              runbook_url: "docs/runbooks/quality-observability.md"
+            labels:
+              severity: warning
+              source: quality-agent
+              target: local-infra
+
+          # 2) いずれかの特性スコアが前回 run 比で 10.0 以上低下
+          #    (両 run とも insufficient_data=false の特性のみ比較。WHERE で絞らず
+          #     全特性を返すことで、閾値未満に戻ったインスタンスが自動 resolve される)
+          - uid: quality-characteristic-drop
+            title: Quality characteristic score dropped vs previous run
+            condition: C
+            data:
+              - refId: A
+                relativeTimeRange: {from: 600, to: 0}
+                datasourceUid: quality-postgres
+                model:
+                  refId: A
+                  format: table
+                  rawQuery: true
+                  rawSql: |
+                    WITH ranked AS (
+                      SELECT run_id,
+                             ROW_NUMBER() OVER (ORDER BY scored_at DESC) AS rn
+                      FROM quality_runs
+                      WHERE target = 'local-infra'
+                    ),
+                    cur AS (
+                      SELECT s.characteristic, s.score
+                      FROM quality_characteristic_scores s
+                      JOIN ranked t ON s.run_id = t.run_id AND t.rn = 1
+                      WHERE NOT s.insufficient_data
+                    ),
+                    prev AS (
+                      SELECT s.characteristic, s.score
+                      FROM quality_characteristic_scores s
+                      JOIN ranked t ON s.run_id = t.run_id AND t.rn = 2
+                      WHERE NOT s.insufficient_data
+                    )
+                    SELECT cur.characteristic,
+                           prev.score - cur.score AS score_drop
+                    FROM cur
+                    JOIN prev USING (characteristic);
+              - refId: C
+                relativeTimeRange: {from: 0, to: 0}
+                datasourceUid: __expr__
+                model:
+                  refId: C
+                  type: threshold
+                  datasource: {type: __expr__, uid: __expr__}
+                  expression: A
+                  conditions:
+                    - evaluator: {type: gt, params: [9.9]}
+            noDataState: OK
+            execErrState: Error
+            for: 0s
+            annotations:
+              summary: "特性 {{ $labels.characteristic }} が前回 run 比で {{ $values.A }} ポイント低下した"
+              runbook_url: "docs/runbooks/quality-observability.md"
+            labels:
+              severity: warning
+              source: quality-agent
+              target: local-infra
+
+          # 3) 総合スコアの絶対閾値 (< 50)
+          - uid: quality-overall-low
+            title: Quality overall score below 50
+            condition: C
+            data:
+              - refId: A
+                relativeTimeRange: {from: 600, to: 0}
+                datasourceUid: quality-postgres
+                model:
+                  refId: A
+                  format: table
+                  rawQuery: true
+                  rawSql: |
+                    SELECT overall
+                    FROM quality_runs
+                    WHERE target = 'local-infra'
+                    ORDER BY scored_at DESC
+                    LIMIT 1;
+              - refId: C
+                relativeTimeRange: {from: 0, to: 0}
+                datasourceUid: __expr__
+                model:
+                  refId: C
+                  type: threshold
+                  datasource: {type: __expr__, uid: __expr__}
+                  expression: A
+                  conditions:
+                    - evaluator: {type: lt, params: [50]}
+            noDataState: OK
+            execErrState: Error
+            for: 0s
+            annotations:
+              summary: "総合スコアが絶対閾値 50 を下回った ({{ $values.A }})"
+              runbook_url: "docs/runbooks/quality-observability.md"
+            labels:
+              severity: critical
+              source: quality-agent
+              target: local-infra
+
+          # 4) run 鮮度: 最新 run が 30 時間より古い (nightly 停止検知)。
+          #    run が 1 件も無い場合は COALESCE で巨大値を返して必ず発火させる
+          - uid: quality-run-stale
+            title: Quality nightly run is stale (>30h)
+            condition: C
+            data:
+              - refId: A
+                relativeTimeRange: {from: 600, to: 0}
+                datasourceUid: quality-postgres
+                model:
+                  refId: A
+                  format: table
+                  rawQuery: true
+                  rawSql: |
+                    SELECT COALESCE(
+                      EXTRACT(EPOCH FROM (now() - MAX(scored_at))) / 3600.0,
+                      99999) AS hours_since_last_run
+                    FROM quality_runs
+                    WHERE target = 'local-infra';
+              - refId: C
+                relativeTimeRange: {from: 0, to: 0}
+                datasourceUid: __expr__
+                model:
+                  refId: C
+                  type: threshold
+                  datasource: {type: __expr__, uid: __expr__}
+                  expression: A
+                  conditions:
+                    - evaluator: {type: gt, params: [30]}
+            noDataState: Alerting
+            execErrState: Error
+            for: 0s
+            annotations:
+              summary: "quality-agent nightly の最終 run から {{ $values.A }} 時間が経過 (CronJob 停止の疑い)"
+              runbook_url: "docs/runbooks/quality-observability.md"
+            labels:
+              severity: warning
+              source: quality-agent
+              target: local-infra
